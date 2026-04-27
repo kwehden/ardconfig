@@ -1,5 +1,0 @@
-# Dangerous Commands Allowlist
-# Add one command pattern per line to permit commands that would otherwise be blocked.
-# Lines starting with # are comments.
-# Example:
-# git push --force staging

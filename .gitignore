@@ -13,3 +13,6 @@ conf/known-macs.conf
 *.swp
 *.swo
 *~
+
+# Kiro agent tooling (local)
+.kiro/
