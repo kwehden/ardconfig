@@ -9,8 +9,11 @@ Reusable bootstrap package for configuring Ubuntu systems to develop with Arduin
 | Arduino Uno Q | `uno-q` | `arduino:zephyr:unoq` | `arduino:zephyr` (BETA) |
 | Arduino Uno R4 WiFi | `r4wifi` | `arduino:renesas_uno:unor4wifi` | `arduino:renesas_uno` |
 | Arduino Giga R1 WiFi | `giga` | `arduino:mbed_giga:giga` | `arduino:mbed_giga` |
+| STM32 Nucleo-F411RE | `nucleo-f411re` | `STMicroelectronics:stm32:Nucleo_64:pnum=NUCLEO_F411RE` | `STMicroelectronics:stm32` |
 
 The **Giga Display Shield** (ASX00039) is a peripheral that attaches to the Giga R1 WiFi board — the `giga` profile covers both.
+
+The **Nucleo-F411RE** is the first non-Arduino-branded board, onboarded via the AI-powered `ardconfig-onboard` flow.
 
 ## Prerequisites
 
@@ -69,6 +72,38 @@ bin/ardconfig-detect --json    # JSON output for agents
 ```
 
 Works in **degraded mode** without `jq` — reports USB device info without board profile enrichment.
+
+Unrecognized USB devices (vendor/product ID not matching any profile) are reported as `unknown` with a suggestion to run `ardconfig-onboard`:
+
+```json
+{
+  "unknown_boards": [
+    {"device": "/dev/ttyACM0", "vendor_id": "0483", "product_id": "374b", "name": "STM32_STLink", "status": "unknown"}
+  ]
+}
+```
+
+### `ardconfig-onboard`
+
+AI-powered board onboarding. Plug in an unknown board and let a Strands AI agent (backed by Amazon Bedrock) research it, generate a board profile, install the core, and verify compilation.
+
+```bash
+bin/ardconfig-onboard                                          # Auto-detect unknown USB device
+bin/ardconfig-onboard --vendor-id 0483 --product-id 374b       # Headless mode (no hardware needed)
+bin/ardconfig-onboard --board-name "Nucleo-F411RE"             # Research by name
+bin/ardconfig-onboard --non-interactive --json                 # Agent/CI mode
+```
+
+What it does:
+1. Scans USB for unrecognized devices (or accepts `--vendor-id`/`--product-id`/`--board-name`)
+2. Invokes a Strands AI agent to research the board (FQBN, core, board manager URL, driver, LED pin, etc.)
+3. Generates and validates a board profile JSON
+4. Prompts for confirmation (auto-approved in `--non-interactive` mode)
+5. Writes the profile to `profiles/`, updates udev rules for new vendor IDs
+6. Runs `ardconfig-setup` to install the core and `ardconfig-verify` to compile a test sketch
+7. If setup or verify fails, the agent iterates (adjusts profile, retries)
+
+**Prerequisites:** AWS credentials configured with Amazon Bedrock access. AI dependencies (`strands-agents`, `boto3`) are installed automatically on first use.
 
 ### `ardconfig-discover`
 
@@ -181,6 +216,8 @@ ARDCONFIG_BOARDS="uno-q,r4wifi,giga"   # Boards to install
 ARDCONFIG_VENV_PATH=".venv"            # Python venv location
 ARDCONFIG_PYTHON_PACKAGES="pyserial"   # Python packages
 ARDCONFIG_CLI_VERSION=""               # arduino-cli version (empty = latest)
+ARDCONFIG_BEDROCK_MODEL=""             # Bedrock model (default: us.anthropic.claude-sonnet-4-6)
+ARDCONFIG_AWS_REGION=""                # AWS region (default: us-west-2)
 ```
 
 ### `conf/known-macs.conf`
@@ -189,7 +226,10 @@ MAC addresses for network discovery on MAC-registered networks. Copy from `conf/
 
 ### Board Profiles (`profiles/*.json`)
 
-Each board is described by a JSON profile. To add a new board, create a new JSON file — no script changes needed. See existing profiles for the schema.
+Each board is described by a JSON profile. To add a new board, you have two options:
+
+1. **AI-assisted (recommended):** Run `bin/ardconfig-onboard` — the AI agent researches the board and generates a validated profile automatically.
+2. **Manual:** Create a new JSON file in `profiles/` following the existing schema — no script changes needed.
 
 ## Troubleshooting
 
@@ -211,8 +251,13 @@ ardconfig/
 │   ├── ardconfig-setup
 │   ├── ardconfig-detect
 │   ├── ardconfig-discover
+│   ├── ardconfig-onboard   # AI-powered board onboarding
 │   ├── ardconfig-verify
 │   └── ardconfig-health
+├── agent/                  # Python AI agent (Strands AI + Bedrock)
+│   ├── __init__.py
+│   ├── onboard_agent.py    # Agent definition and entry point
+│   └── tools.py            # Agent tool definitions
 ├── lib/                    # Shared bash libraries
 │   ├── output.sh           # JSON-canonical output formatting
 │   ├── common.sh           # Arg parsing, exit codes, sudo helpers
@@ -220,7 +265,8 @@ ardconfig/
 ├── profiles/               # Board profile JSON files
 │   ├── uno-q.json
 │   ├── r4wifi.json
-│   └── giga.json
+│   ├── giga.json
+│   └── nucleo-f411re.json  # AI-generated
 ├── conf/                   # Configuration
 │   ├── ardconfig.conf
 │   └── known-macs.conf.example

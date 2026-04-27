@@ -43,6 +43,7 @@ main() {
   fi
 
   local boards_json="[]"
+  local unknown_json="[]"
   local found=false
 
   for dev in /dev/ttyACM* /dev/ttyUSB*; do
@@ -54,73 +55,86 @@ main() {
 
     local vid pid model serial
     vid=$(echo "$info" | grep -oP 'ID_VENDOR_ID=\K.*' || echo "")
-
-    # Match: either Arduino vendor ID or alternate chip match via profiles
-    local is_arduino=false
-    if [[ "$vid" == "2341" ]]; then
-      is_arduino=true
-    elif [[ "$_HAS_PROFILES" == "true" && -n "$vid" ]]; then
-      pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
-      local alt_match
-      alt_match=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
-      [[ -n "$alt_match" ]] && is_arduino=true
-    fi
-    [[ "$is_arduino" == "true" ]] || continue
-
-    found=true
+    [[ -n "$vid" ]] || continue
     pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
     model=$(echo "$info" | grep -oP 'ID_MODEL=\K.*' || echo "")
     serial=$(echo "$info" | grep -oP 'ID_SERIAL_SHORT=\K.*' || echo "")
 
-    local accessible=false
-    [[ -r "$dev" && -w "$dev" ]] && accessible=true
+    # Match against all loaded board profiles
+    local is_known=false
+    if [[ "$_HAS_PROFILES" == "true" && -n "$pid" ]]; then
+      local match
+      match=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+      [[ -n "$match" ]] && is_known=true
+    fi
 
-    # Enrich from profiles if available
-    local board_id="" board_name="" fqbn="" notes=""
-    if [[ "$_HAS_PROFILES" == "true" ]]; then
+    if [[ "$is_known" == "true" ]]; then
+      found=true
+
+      local accessible=false
+      [[ -r "$dev" && -w "$dev" ]] && accessible=true
+
+      # Enrich from profiles
+      local board_id="" board_name="" fqbn="" notes=""
       board_id=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
       if [[ -n "$board_id" ]]; then
         board_name=$(profiles_get "$board_id" name 2>/dev/null || echo "")
         fqbn=$(profiles_get "$board_id" fqbn 2>/dev/null || echo "")
         notes=$(profiles_get "$board_id" notes 2>/dev/null || echo "")
       fi
+
+      # Use USB model string as fallback name
+      [[ -z "$board_name" ]] && board_name="$model"
+
+      local board_entry
+      board_entry=$(jq -n \
+        --arg dev "$dev" \
+        --arg vid "$vid" \
+        --arg pid "$pid" \
+        --arg name "$board_name" \
+        --arg fqbn "$fqbn" \
+        --arg board_id "$board_id" \
+        --arg serial "$serial" \
+        --argjson accessible "$accessible" \
+        --arg notes "$notes" \
+        '{device: $dev, vendor_id: $vid, product_id: $pid, name: $name, fqbn: $fqbn, board_id: $board_id, serial: $serial, accessible: $accessible} + (if $notes != "" then {notes: $notes} else {} end)' 2>/dev/null)
+
+      if [[ -n "$board_entry" ]]; then
+        boards_json=$(echo "$boards_json" | jq --argjson b "$board_entry" '. + [$b]')
+      fi
+
+      local access_str="accessible"
+      [[ "$accessible" == "false" ]] && access_str="NOT accessible (run ardconfig-setup)"
+      output_step ok "board_${dev##*/}" "${board_name:-Unknown} on ${dev} [${fqbn:-unknown FQBN}] — ${access_str}"
+    else
+      # Unknown device with a vendor ID but no profile match (FR-1)
+      local unknown_entry
+      unknown_entry=$(jq -n \
+        --arg dev "$dev" \
+        --arg vid "$vid" \
+        --arg pid "$pid" \
+        --arg name "$model" \
+        --arg serial "$serial" \
+        '{device: $dev, vendor_id: $vid, product_id: $pid, name: $name, status: "unknown"}' 2>/dev/null)
+
+      if [[ -n "$unknown_entry" ]]; then
+        unknown_json=$(echo "$unknown_json" | jq --argjson b "$unknown_entry" '. + [$b]')
+      fi
+
+      output_step info "unknown_${dev##*/}" "Unknown device on ${dev} [vendor=${vid} product=${pid}] — run ardconfig-onboard"
     fi
-
-    # Use USB model string as fallback name
-    [[ -z "$board_name" ]] && board_name="$model"
-
-    local board_entry
-    board_entry=$(jq -n \
-      --arg dev "$dev" \
-      --arg vid "$vid" \
-      --arg pid "$pid" \
-      --arg name "$board_name" \
-      --arg fqbn "$fqbn" \
-      --arg board_id "$board_id" \
-      --arg serial "$serial" \
-      --argjson accessible "$accessible" \
-      --arg notes "$notes" \
-      '{device: $dev, vendor_id: $vid, product_id: $pid, name: $name, fqbn: $fqbn, board_id: $board_id, serial: $serial, accessible: $accessible} + (if $notes != "" then {notes: $notes} else {} end)' 2>/dev/null)
-
-    if [[ -n "$board_entry" ]]; then
-      boards_json=$(echo "$boards_json" | jq --argjson b "$board_entry" '. + [$b]')
-    fi
-
-    local access_str="accessible"
-    [[ "$accessible" == "false" ]] && access_str="NOT accessible (run ardconfig-setup)"
-    output_step ok "board_${dev##*/}" "${board_name:-Unknown} on ${dev} [${fqbn:-unknown FQBN}] — ${access_str}"
   done
 
   if [[ "$found" == "false" ]]; then
     output_step error no_boards "No Arduino boards detected. Check USB connection."
     local extra
-    extra=$(jq -n --argjson b "$boards_json" '{boards: $b}')
+    extra=$(jq -n --argjson b "$boards_json" --argjson u "$unknown_json" '{boards: $b, unknown_boards: $u}')
     output_result "$EXIT_NO_HW" "$extra"
     exit "$EXIT_NO_HW"
   fi
 
   local extra
-  extra=$(jq -n --argjson b "$boards_json" '{boards: $b}')
+  extra=$(jq -n --argjson b "$boards_json" --argjson u "$unknown_json" '{boards: $b, unknown_boards: $u}')
   output_result "$EXIT_OK" "$extra"
   exit "$EXIT_OK"
 }

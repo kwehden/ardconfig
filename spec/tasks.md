@@ -1,37 +1,39 @@
-# Tasks — ardconfig
+# Tasks — AI-Powered Hardware Onboarding for ardconfig
 
-Tasks are ordered by dependency. Each task produces a testable artifact.
+## Dependency Graph
+
+```
+TASK-001 (config)
+    │
+TASK-002 (detect changes) ──────────────────────┐
+    │                                            │
+TASK-003 (agent package + tools)                 │
+    │                                            │
+TASK-004 (onboard script)  ◄─── TASK-001,002,003│
+    │                                            │
+TASK-005 (Nucleo-F411RE end-to-end test) ◄──────┘
+    │
+TASK-006 (README update)
+```
 
 ---
 
-## TASK-001: Project scaffolding and shared libraries
+## TASK-001: Configuration additions
 
-**Description:** Create the directory structure, shared output library (`lib/output.sh`), common library (`lib/common.sh`), and board profiles library (`lib/board-profiles.sh`).
+**Objective:** Add Bedrock model and AWS region settings to ardconfig.conf.
 
-**Requirements:** NFR-3.1, NFR-5.1–5.5, NFR-7.1–7.2
+**Requirements:** FR-11, FR-12
 
-**Inputs:** spec/design.md §1 (Architecture Overview), §3.1–3.3
+**Write Lease:** `conf/ardconfig.conf`
 
-**Outputs:**
-- `bin/` (empty, placeholder)
-- `lib/output.sh`
-- `lib/common.sh`
-- `lib/board-profiles.sh`
-- `profiles/` (empty, placeholder)
-- `conf/` (empty, placeholder)
-- `templates/` (empty, placeholder)
-- `udev/` (empty, placeholder)
-- `.gitignore` (exclude `.venv/`, build artifacts, `conf/known-macs.conf`)
+**Change Budget:** max_files: 1, max_new_symbols: 2, interface_policy: extend_only
 
-**Write lease:** `lib/**`, `bin/.gitkeep`, `profiles/.gitkeep`, `conf/.gitkeep`, `templates/.gitkeep`, `udev/.gitkeep`, `.gitignore`
-
-**Change budget:** max_files: 7, max_new_symbols: 20, interface_policy: new
+**Steps:**
+1. Append `ARDCONFIG_BEDROCK_MODEL` and `ARDCONFIG_AWS_REGION` settings to `conf/ardconfig.conf` with comments and empty defaults.
 
 **Verification:**
-- `bash -n lib/output.sh` — no syntax errors
-- `bash -n lib/common.sh` — no syntax errors
-- `bash -n lib/board-profiles.sh` — no syntax errors
-- Source all three libraries in a test script and call `output_init`, `parse_args`, `profiles_load` without error
+- `source conf/ardconfig.conf` succeeds without errors
+- New variables are defined (empty = use default)
 
 **Risk:** Low
 
@@ -39,261 +41,181 @@ Tasks are ordered by dependency. Each task produces a testable artifact.
 
 ---
 
-## TASK-002: Board profiles
+## TASK-002: Generalize ardconfig-detect vendor ID matching
 
-**Description:** Create the three board profile JSON files and the blink template.
+**Objective:** Remove the hardcoded `vid == "2341"` filter in ardconfig-detect. Match all USB devices against loaded profiles. Report unrecognized devices as `unknown`.
 
-**Requirements:** FR-2.3, FR-2.4, FR-4.2, FR-6.1
+**Requirements:** FR-1, FR-2, NFR-6
 
-**Inputs:** spec/design.md §2 (Board Profile Schema), §7 (Blink Template), spec/context.md §12 (Resolved Research)
+**Write Lease:** `bin/ardconfig-detect`
 
-**Outputs:**
-- `profiles/uno-q.json`
-- `profiles/r4wifi.json`
-- `profiles/giga.json`
-- `templates/blink.ino`
+**Change Budget:** max_files: 1, max_new_symbols: 3, interface_policy: extend_only
 
-**Write lease:** `profiles/**`, `templates/**`
-
-**Change budget:** max_files: 4, max_new_symbols: 0, interface_policy: new
+**Steps:**
+1. Remove the `[[ "$vid" == "2341" ]]` primary check.
+2. For every `/dev/ttyACM*` and `/dev/ttyUSB*` device with a non-empty vendor ID, call `profiles_match_usb "$vid" "$pid"`.
+3. If matched: existing behavior (enrich from profile, add to `boards` array).
+4. If not matched: add to a new `unknown_boards` array with `status: "unknown"`, device path, vendor ID, product ID, USB model string. Emit an `[INFO]` step suggesting `ardconfig-onboard`.
+5. Include `unknown_boards` in the JSON output alongside `boards`.
 
 **Verification:**
-- Each JSON file is valid: `jq . profiles/*.json`
-- Each JSON file contains required fields: `id`, `fqbn`, `core`, `usb_vendor_id`, `usb_product_id`
-- `board-profiles.sh` can load all profiles and resolve fields
-- `blink.ino` compiles conceptually (valid C++ syntax)
+- With an Arduino board (vendor 2341) connected: output is identical to before (NFR-6).
+- With Nucleo-F411RE (vendor 0483) connected and no profile: it appears in `unknown_boards`.
+- With no devices connected: exit code 3, empty arrays.
+
+**Risk:** Medium — must not break existing detection. Test with real hardware.
+
+**Dependencies:** None
+
+---
+
+## TASK-003: Create Python agent package
+
+**Objective:** Create the `agent/` package with the Strands AI agent and tool definitions.
+
+**Requirements:** FR-7, FR-8, FR-9, FR-10, FR-13, FR-15, FR-19, FR-20, FR-21
+
+**Write Lease:** `agent/**`
+
+**Change Budget:** max_files: 3, max_new_symbols: 15, interface_policy: new_component
+
+**Steps:**
+1. Create `agent/__init__.py` (empty package marker).
+2. Create `agent/tools.py` with tool functions:
+   - `arduino_cli_search(command: str) → str` — runs arduino-cli subcommands
+   - `web_search(query: str) → str` — web search for board docs (use Strands built-in or simple implementation)
+   - `read_file(path: str) → str` — read files within project directory
+   - `write_file(path: str, content: str) → str` — write files to profiles/ only
+   - `validate_profile(profile_path: str) → str` — invoke jq validation via subprocess
+   - `run_setup(board_id: str) → str` — invoke ardconfig-setup --boards <id> --non-interactive --json
+   - `run_verify(board_id: str) → str` — invoke ardconfig-verify --boards <id> --json
+3. Create `agent/onboard_agent.py` with:
+   - System prompt (board identification agent instructions)
+   - `create_agent()` — instantiate Strands Agent with BedrockModel and tools
+   - `main()` — read JSON from stdin, invoke agent, parse profile from response, write JSON to stdout
+   - `build_prompt(input_data)` — construct the research prompt from vendor/product/name
+   - `parse_agent_output(result)` — extract profile JSON from agent response
+
+**Verification:**
+- `python -c "from agent.onboard_agent import create_agent"` succeeds (with deps installed)
+- `python -c "from agent.tools import arduino_cli_search, validate_profile"` succeeds
+- Tools can be called independently (unit-testable)
+
+**Risk:** Medium — Strands AI SDK API surface may differ from design assumptions. Verify tool decorator syntax against SDK docs.
+
+**Dependencies:** None (can be developed in parallel with TASK-001 and TASK-002)
+
+---
+
+## TASK-004: Create bin/ardconfig-onboard script
+
+**Objective:** Create the bash wrapper script that orchestrates the onboarding flow.
+
+**Requirements:** FR-3, FR-4, FR-5, FR-6, FR-14, FR-16, FR-17, FR-18, FR-22, FR-23, FR-24, NFR-1, NFR-2, NFR-3
+
+**Write Lease:** `bin/ardconfig-onboard`
+
+**Change Budget:** max_files: 1, max_new_symbols: 12, interface_policy: new_component
+
+**Steps:**
+1. Create `bin/ardconfig-onboard` with:
+   - Shebang, set -euo pipefail, source common.sh + output.sh + board-profiles.sh
+   - `usage()` — help text with all flags
+   - Arg parsing: `--vendor-id`, `--product-id`, `--board-name`, plus standard flags
+   - `ensure_ai_deps()` — JIT install strands-agents and boto3 (FR-22)
+   - `check_aws_credentials()` — verify AWS creds via Python boto3 sts get-caller-identity (FR-23)
+   - `scan_unknown_devices()` — find USB devices not matching any profile (FR-4)
+   - `invoke_agent()` — call Python agent via subprocess, pass JSON stdin, read JSON stdout
+   - `confirm_profile()` — display profile, prompt y/n, allow id override (FR-16, FR-14)
+   - `write_profile()` — write to profiles/<id>.json, check conflicts (FR-17)
+   - `update_udev_rules()` — append vendor ID rule if new (FR-18)
+   - `handle_partial_failure()` — output TODO template, suggest Kiro (FR-24)
+   - `main()` — orchestrate the full flow
+2. Make executable: `chmod +x bin/ardconfig-onboard`
+
+**Verification:**
+- `bin/ardconfig-onboard --help` exits 0 with usage text
+- `bin/ardconfig-onboard --json --help` exits 0
+- Without AWS creds: exits 2 with clear error
+- Without venv: exits 2 with clear error
+- With `--vendor-id 0483 --product-id 374b`: invokes agent and produces output
+
+**Risk:** Medium — integration of bash wrapper with Python subprocess. Test the stdin/stdout JSON contract carefully.
+
+**Dependencies:** TASK-001 (config), TASK-002 (detect for scan logic reference), TASK-003 (agent package)
+
+---
+
+## TASK-005: End-to-end test with Nucleo-F411RE
+
+**Objective:** Run the complete onboarding flow with the Nucleo-F411RE hardware to validate the entire pipeline.
+
+**Requirements:** AC-001 through AC-009
+
+**Write Lease:** `profiles/nucleo-f411re.json` (generated output)
+
+**Change Budget:** max_files: 2, max_new_symbols: 0, interface_policy: extend_only
+
+**Steps:**
+1. Ensure Nucleo-F411RE is connected via USB.
+2. Run `bin/ardconfig-onboard` (hardware-present mode) — verify it detects the unknown device.
+3. Verify the agent researches and generates a valid profile.
+4. Confirm the profile at the prompt.
+5. Verify `profiles/nucleo-f411re.json` is written and passes validation (AC-001).
+6. Verify `udev/99-arduino.rules` contains vendor `0483` (AC-005).
+7. Run `bin/ardconfig-detect --json` — verify Nucleo appears in `boards` (AC-002).
+8. Verify `ardconfig-setup --boards nucleo-f411re` installed the stm32duino core (AC-003).
+9. Verify `ardconfig-verify --boards nucleo-f411re` compiles Blink successfully (AC-004).
+10. Also test headless mode: `bin/ardconfig-onboard --vendor-id 0483 --product-id 374b --board-name "Nucleo-F411RE"` (AC-007).
+
+**Verification:**
+- All 9 acceptance criteria pass.
+- Generated profile matches expected values (FQBN, core, core_url, vendor/product IDs).
+
+**Risk:** High — depends on AI agent producing correct output, Bedrock availability, and hardware being connected. This is the integration test.
+
+**Dependencies:** TASK-004 (all components must be in place)
+
+---
+
+## TASK-006: Update README and documentation
+
+**Objective:** Update README.md to document the new onboarding feature, the Nucleo-F411RE board, and the updated detect behavior.
+
+**Requirements:** Docs completeness
+
+**Write Lease:** `README.md`
+
+**Change Budget:** max_files: 1, max_new_symbols: 0, interface_policy: extend_only
+
+**Steps:**
+1. Add `ardconfig-onboard` to the Scripts section with usage and description.
+2. Add Nucleo-F411RE to the Supported Boards table.
+3. Add a "Adding New Boards" section explaining both manual (JSON) and AI-assisted (onboard) methods.
+4. Document the AI prerequisites (AWS credentials, Bedrock access).
+5. Update the ardconfig-detect section to mention unknown device reporting.
+
+**Verification:**
+- README accurately describes all new functionality.
+- No broken markdown formatting.
 
 **Risk:** Low
 
-**Dependencies:** TASK-001
+**Dependencies:** TASK-005 (need final profile and confirmed behavior to document accurately)
 
 ---
-
-## TASK-003: Configuration files and udev rules
-
-**Description:** Create `conf/ardconfig.conf`, `conf/known-macs.conf`, and `udev/99-arduino.rules`.
-
-**Requirements:** FR-1.2, FR-5.3, NFR-1.1
-
-**Inputs:** spec/design.md §4 (udev Rules), §5 (Configuration File), §6 (Known MACs)
-
-**Outputs:**
-- `conf/ardconfig.conf`
-- `conf/known-macs.conf`
-- `udev/99-arduino.rules`
-
-**Write lease:** `conf/**`, `udev/**`
-
-**Change budget:** max_files: 3, max_new_symbols: 0, interface_policy: new
-
-**Verification:**
-- `udevadm verify udev/99-arduino.rules` or manual syntax check
-- `conf/ardconfig.conf` is valid bash (sourceable without error)
-- `conf/known-macs.conf` has correct format with comments
-
-**Risk:** Low
-
-**Dependencies:** None (parallel with TASK-001/002)
-
----
-
-## TASK-004: `ardconfig-setup`
-
-**Description:** Implement the main setup script covering system access, tool installation, Python environment, and network discovery dependencies.
-
-**Requirements:** FR-1.1–1.5, FR-2.1–2.6, FR-3.1–3.4, FR-5.1, NFR-1.1, NFR-2.1–2.2, NFR-4.1–4.3
-
-**Inputs:** spec/design.md §3.4
-
-**Outputs:**
-- `bin/ardconfig-setup`
-
-**Write lease:** `bin/ardconfig-setup`
-
-**Change budget:** max_files: 1, max_new_symbols: 12, interface_policy: new
-
-**Verification:**
-- `bash -n bin/ardconfig-setup` — no syntax errors
-- `bin/ardconfig-setup --help` prints usage
-- `bin/ardconfig-setup --json --non-interactive` produces valid JSON output
-- Idempotency: run twice, second run reports all steps as `[SKIP]` or `[OK]`
-- On the live system: after running, `ls -la /dev/ttyACM0` shows accessible permissions
-- `arduino-cli version` works after setup
-- `arduino-cli core list` shows installed cores matching `--boards` selection
-- `.venv/bin/python -c "import serial"` succeeds
-
-**Risk:** Medium — requires sudo, installs system packages, modifies udev rules
-
-**Dependencies:** TASK-001, TASK-002, TASK-003
-
----
-
-## TASK-005: `ardconfig-detect`
-
-**Description:** Implement USB board detection with degraded mode (no jq) support.
-
-**Requirements:** FR-4.1–4.5
-
-**Inputs:** spec/design.md §3.5
-
-**Outputs:**
-- `bin/ardconfig-detect`
-
-**Write lease:** `bin/ardconfig-detect`
-
-**Change budget:** max_files: 1, max_new_symbols: 6, interface_policy: new
-
-**Verification:**
-- `bash -n bin/ardconfig-detect` — no syntax errors
-- `bin/ardconfig-detect --help` prints usage
-- With Uno Q connected: outputs device path, product ID, board name, FQBN
-- `bin/ardconfig-detect --json` produces valid JSON with board array
-- With no boards connected: exits with code 3
-- Degraded mode: temporarily hide jq (`PATH` manipulation), verify detect still works with warning
-
-**Risk:** Low
-
-**Dependencies:** TASK-001, TASK-002
-
----
-
-## TASK-006: `ardconfig-discover`
-
-**Description:** Implement network discovery with the mDNS → known MACs → ARP → nmap fallback chain.
-
-**Requirements:** FR-5.2–5.6
-
-**Inputs:** spec/design.md §3.6
-
-**Outputs:**
-- `bin/ardconfig-discover`
-
-**Write lease:** `bin/ardconfig-discover`
-
-**Change budget:** max_files: 1, max_new_symbols: 8, interface_policy: new
-
-**Verification:**
-- `bash -n bin/ardconfig-discover` — no syntax errors
-- `bin/ardconfig-discover --help` prints usage
-- `bin/ardconfig-discover --json` produces valid JSON (even if empty results)
-- With a known MAC in `conf/known-macs.conf` and the board on WiFi: discovers the board
-- With no boards on network: exits with code 3 and diagnostic message
-
-**Risk:** Medium — depends on network environment, mDNS availability
-
-**Dependencies:** TASK-001, TASK-002, TASK-003
-
----
-
-## TASK-007: `ardconfig-verify`
-
-**Description:** Implement build and upload verification using board profiles and the blink template.
-
-**Requirements:** FR-6.1–6.4
-
-**Inputs:** spec/design.md §3.7
-
-**Outputs:**
-- `bin/ardconfig-verify`
-
-**Write lease:** `bin/ardconfig-verify`
-
-**Change budget:** max_files: 1, max_new_symbols: 6, interface_policy: new
-
-**Verification:**
-- `bash -n bin/ardconfig-verify` — no syntax errors
-- `bin/ardconfig-verify --help` prints usage
-- Compiles blink for each installed core without errors
-- `bin/ardconfig-verify --json` produces valid JSON with per-board compile results
-- With `--fqbn arduino:renesas_uno:unor4wifi --port /dev/ttyACM0`: targets specific board
-- Compilation failure (bad FQBN): exits with code 1 and shows compiler error
-
-**Risk:** Medium — depends on arduino-cli and cores being installed (TASK-004)
-
-**Dependencies:** TASK-001, TASK-002, TASK-004 (cores must be installed)
-
----
-
-## TASK-008: `ardconfig-health`
-
-**Description:** Implement the health check orchestrator that runs all checks and produces an aggregated report.
-
-**Requirements:** FR-7.1–7.4
-
-**Inputs:** spec/design.md §3.8
-
-**Outputs:**
-- `bin/ardconfig-health`
-
-**Write lease:** `bin/ardconfig-health`
-
-**Change budget:** max_files: 1, max_new_symbols: 8, interface_policy: new
-
-**Verification:**
-- `bash -n bin/ardconfig-health` — no syntax errors
-- `bin/ardconfig-health --help` prints usage
-- On a fully configured system: all checks pass, exit code 0
-- `bin/ardconfig-health --json` produces valid JSON with per-check results
-- On a fresh system (before setup): reports failures for missing tools, exit code 1 or 4
-
-**Risk:** Low — orchestration only, no system modifications
-
-**Dependencies:** TASK-005, TASK-006, TASK-007 (uses detect/discover/verify logic)
-
----
-
-## TASK-009: README
-
-**Description:** Write the human+agent-friendly README covering supported boards, prerequisites, quick start, script usage, exit codes, troubleshooting, and agent invocation.
-
-**Requirements:** NFR-6.1–6.2
-
-**Inputs:** All spec files, all scripts (for usage examples)
-
-**Outputs:**
-- `README.md`
-
-**Write lease:** `README.md`
-
-**Change budget:** max_files: 1, max_new_symbols: 0, interface_policy: new
-
-**Verification:**
-- README renders correctly as markdown
-- Quick Start section has ≤5 commands
-- All scripts are documented with usage examples
-- Exit codes table matches NFR-3.1
-- Agent invocation section explains JSON mode and non-interactive flags
-- Giga Display Shield clarification is present
-
-**Risk:** Low
-
-**Dependencies:** TASK-004–008 (needs final script interfaces)
-
----
-
-## Task Dependency Graph
-
-```
-TASK-001 (scaffolding) ──┬──→ TASK-004 (setup) ──→ TASK-007 (verify) ──┐
-                         │                                               │
-TASK-002 (profiles)  ────┤──→ TASK-005 (detect) ──────────────────────┤
-                         │                                               ├──→ TASK-008 (health) ──→ TASK-009 (README)
-TASK-003 (config/udev) ──┴──→ TASK-006 (discover) ────────────────────┘
-```
-
-## Execution Order
-
-| Phase | Tasks | Can parallelize? |
-|---|---|---|
-| 1 | TASK-001, TASK-002, TASK-003 | Yes — independent |
-| 2 | TASK-004, TASK-005, TASK-006 | Partially — 005/006 can parallel, 004 first if testing on live system |
-| 3 | TASK-007 | No — needs cores from TASK-004 |
-| 4 | TASK-008 | No — needs 005/006/007 |
-| 5 | TASK-009 | No — needs all scripts finalized |
 
 ## Summary
 
-- **9 tasks** total
-- **3 low-risk**, **3 medium-risk**, **3 low-risk** (docs/scaffolding)
-- **1 task requires sudo** (TASK-004)
-- Estimated implementation: Phase 1–3 are the core work; Phase 4–5 are integration and docs
+| Task | Description | Risk | Dependencies | Est. Complexity |
+|---|---|---|---|---|
+| TASK-001 | Config additions | Low | None | Small |
+| TASK-002 | Detect vendor generalization | Medium | None | Small |
+| TASK-003 | Python agent package | Medium | None | Medium |
+| TASK-004 | Onboard bash script | Medium | 001, 002, 003 | Medium |
+| TASK-005 | E2E test with Nucleo-F411RE | High | 004 | Medium |
+| TASK-006 | README update | Low | 005 | Small |
+
+**Parallelizable:** TASK-001, TASK-002, and TASK-003 can be developed in parallel.
+
+**Critical path:** TASK-003 → TASK-004 → TASK-005 → TASK-006
