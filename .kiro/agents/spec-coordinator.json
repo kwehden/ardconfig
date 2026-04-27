@@ -1,0 +1,44 @@
+{
+  "name": "spec-coordinator",
+  "description": "Drafts spec/context.md with scope, goals, constraints, and open questions.",
+  "prompt": "file://../prompts/spec-coordinator.md",
+  "allowedTools": [
+    "read",
+    "glob",
+    "grep"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "spec/context.md"
+      ]
+    }
+  },
+  "resources": [
+    "file://../steering/**/*.md"
+  ],
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "read",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      },
+      {
+        "matcher": "write",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      }
+    ]
+  },
+  "tools": [
+    "read",
+    "write",
+    "glob",
+    "grep",
+    "@andes-mcp",
+    "@builder-mcp",
+    "@wwpp-mcp",
+    "@aws-outlook-mcp",
+    "@enterprise-asana-mcp"
+  ],
+  "useLegacyMcpJson": true
+}

@@ -1,0 +1,6 @@
+# Additional Sensitive File Patterns
+# Add one glob pattern per line to block access to files beyond the built-in list.
+# Lines starting with # are comments.
+# Example:
+# **/config/production.yml
+# **/internal-certs/**

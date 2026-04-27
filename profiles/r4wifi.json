@@ -1,0 +1,15 @@
+{
+  "id": "r4wifi",
+  "name": "Arduino Uno R4 WiFi",
+  "fqbn": "arduino:renesas_uno:unor4wifi",
+  "core": "arduino:renesas_uno",
+  "core_url": "",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "1002",
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "Mature board with well-established library ecosystem."
+}

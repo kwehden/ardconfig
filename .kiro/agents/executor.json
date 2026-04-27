@@ -1,0 +1,107 @@
+{
+  "name": "executor",
+  "description": "Implements approved tasks with small diffs, TDD verification, and self-correction up to 2 attempts.",
+  "prompt": "file://../prompts/executor.md",
+  "allowedTools": [
+    "read",
+    "glob",
+    "grep",
+    "code",
+    "thinking"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "src/**",
+        "lib/**",
+        "app/**",
+        "pkg/**",
+        "cmd/**",
+        "internal/**",
+        "tests/**",
+        "test/**",
+        "**/*.test.*",
+        "**/*.spec.*",
+        "spec/**/*.md",
+        "docs/**/*.md",
+        "*.json",
+        "*.yaml",
+        "*.yml",
+        "*.toml",
+        "*.cfg",
+        "Makefile",
+        "Dockerfile",
+        "*.dockerfile",
+        "*.md"
+      ],
+      "deniedPaths": [
+        "third_party/**",
+        "vendor/**",
+        "node_modules/**",
+        "dist/**",
+        "build/**",
+        "out/**",
+        ".git/**",
+        ".kiro/**",
+        "target/**",
+        ".next/**",
+        ".nuxt/**",
+        "__pycache__/**",
+        ".venv/**",
+        "venv/**",
+        ".tox/**"
+      ]
+    },
+    "shell": {
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../steering/**/*.md"
+  ],
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "shell",
+        "command": ".kiro/hooks/dangerous-command-blocker.sh"
+      },
+      {
+        "matcher": "read",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      },
+      {
+        "matcher": "write",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      },
+      {
+        "matcher": "shell",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      }
+    ],
+    "postToolUse": [
+      {
+        "matcher": "write",
+        "command": ".kiro/hooks/auto-formatter.sh"
+      },
+      {
+        "matcher": "write",
+        "command": ".kiro/hooks/type-checker.sh"
+      }
+    ]
+  },
+  "tools": [
+    "read",
+    "write",
+    "glob",
+    "grep",
+    "shell",
+    "code",
+    "thinking",
+    "@andes-mcp",
+    "@builder-mcp",
+    "@wwpp-mcp",
+    "@aws-outlook-mcp",
+    "@enterprise-asana-mcp"
+  ],
+  "useLegacyMcpJson": true
+}

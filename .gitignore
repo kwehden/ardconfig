@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+/build/
+/tmp/
+
+# Lab-specific MAC addresses (user-configured)
+conf/known-macs.conf
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

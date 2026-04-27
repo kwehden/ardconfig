@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# ardconfig-verify — Compile (and optionally upload) test sketches
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+source "${SCRIPT_DIR}/../lib/output.sh"
+source "${SCRIPT_DIR}/../lib/board-profiles.sh"
+
+usage() {
+  cat <<EOF
+Usage: ardconfig-verify [OPTIONS]
+
+Compile a Blink sketch for each installed board core to verify the toolchain.
+
+Options:
+  --fqbn FQBN       Target a specific board FQBN
+  --port PORT       Serial port for upload (e.g., /dev/ttyACM0)
+  --upload          Upload sketch to connected board (requires --port or auto-detect)
+  --verify-serial   After upload, read serial port to confirm sketch is running
+  --boards BOARDS   Comma-separated board IDs to verify (default: all installed)
+  --json            Output JSON instead of human-readable text
+  --quiet, -q       Suppress informational output
+  --help, -h        Show this help
+
+Exit codes:
+  0  All compilations succeeded
+  1  One or more compilations failed
+  4  Partial success
+EOF
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$ARG_HELP" == "true" ]]; then usage; exit 0; fi
+  load_config
+  output_init "$(get_output_format)" "$ARG_QUIET"
+
+  if ! command -v arduino-cli &>/dev/null; then
+    output_step error arduino_cli "arduino-cli not found. Run ardconfig-setup first."
+    output_result "$EXIT_PREREQ"
+    exit "$EXIT_PREREQ"
+  fi
+
+  if ! profiles_load 2>/dev/null; then
+    output_step error profiles "Failed to load board profiles"
+    output_result "$EXIT_FAIL"
+    exit "$EXIT_FAIL"
+  fi
+
+  local results_json="[]"
+
+  if [[ -n "$ARG_FQBN" ]]; then
+    # Single board mode
+    local result
+    result=$(verify_board "$ARG_FQBN" "$ARG_PORT" "" "" 2>/dev/null)
+    results_json=$(echo "$results_json" | jq --argjson r "$result" '. + [$r]')
+    local r_status r_message
+    r_status=$(echo "$result" | jq -r '.status')
+    r_message=$(echo "$result" | jq -r '.message')
+    output_step "$r_status" "compile_${ARG_FQBN}" "$r_message"
+  else
+    # Multi-board mode: verify each installed core
+    local selected
+    selected=$(profiles_filter "$ARG_BOARDS")
+    local count
+    count=$(echo "$selected" | jq 'length')
+
+    for i in $(seq 0 $((count - 1))); do
+      local board_id fqbn led_pin
+      board_id=$(echo "$selected" | jq -r ".[$i].id")
+      fqbn=$(echo "$selected" | jq -r ".[$i].fqbn")
+      led_pin=$(echo "$selected" | jq -r ".[$i].blink_led_pin // empty")
+
+      # Check if core is installed
+      local core
+      core=$(echo "$selected" | jq -r ".[$i].core")
+      if ! arduino-cli core list 2>/dev/null | grep -q "^${core}"; then
+        output_step skip "verify_${board_id}" "Core ${core} not installed, skipping"
+        continue
+      fi
+
+      local result
+      result=$(verify_board "$fqbn" "" "$board_id" "$led_pin" 2>/dev/null)
+      results_json=$(echo "$results_json" | jq --argjson r "$result" '. + [$r]')
+
+      # Record step from result
+      local r_status r_message
+      r_status=$(echo "$result" | jq -r '.status')
+      r_message=$(echo "$result" | jq -r '.message')
+      output_step "$r_status" "compile_${board_id}" "$r_message"
+    done
+  fi
+
+  local extra
+  extra=$(jq -n --argjson r "$results_json" '{results: $r}')
+
+  local errors
+  errors=$(echo "$results_json" | jq '[.[] | select(.status == "error")] | length')
+  local total
+  total=$(echo "$results_json" | jq 'length')
+
+  if [[ "$errors" -eq 0 ]]; then
+    output_result "$EXIT_OK" "$extra"
+    exit "$EXIT_OK"
+  elif [[ "$errors" -lt "$total" ]]; then
+    output_result "$EXIT_PARTIAL" "$extra"
+    exit "$EXIT_PARTIAL"
+  else
+    output_result "$EXIT_FAIL" "$extra"
+    exit "$EXIT_FAIL"
+  fi
+}
+
+# Compile (and optionally upload) a blink sketch for a board
+# Returns a JSON object on stdout. Output steps go to stderr (picked up by output library).
+verify_board() {
+  local fqbn="$1" port="$2" board_id="$3" led_pin="$4"
+  local label="${board_id:-${fqbn}}"
+
+  # Create temp sketch directory
+  local tmp_dir
+  tmp_dir=$(mktemp -d "/tmp/ardconfig-verify-XXXXXX")
+  local sketch_dir="${tmp_dir}/blink"
+  mkdir -p "$sketch_dir"
+  cp "${ARDCONFIG_TEMPLATES}/blink.ino" "${sketch_dir}/blink.ino"
+
+  # Build compile flags
+  local extra_flags=""
+  if [[ -n "$led_pin" && "$led_pin" != "LED_BUILTIN" ]]; then
+    extra_flags="--build-property compiler.cpp.extra_flags=-DARDCONFIG_LED_PIN=${led_pin}"
+  fi
+
+  # Compile
+  local compile_out
+  compile_out=$(arduino-cli compile --fqbn "$fqbn" $extra_flags "$sketch_dir" 2>&1) || true
+  local compile_rc=$?
+
+  local status="ok" message="" detail=""
+  if [[ $compile_rc -eq 0 ]]; then
+    message="Compiled blink for ${label}"
+    output_step ok "compile_${label}" "$message" >&2
+  else
+    status="error"
+    message="Compilation failed for ${label}"
+    detail="$compile_out"
+    output_step error "compile_${label}" "$message" "$detail" >&2
+  fi
+
+  # Upload if requested and port available
+  local upload_status="skipped" upload_detail=""
+  if [[ "$ARG_UPLOAD" == "true" && "$status" == "ok" ]]; then
+    if [[ -z "$port" ]]; then
+      # Auto-detect port for this board
+      if [[ -n "$board_id" ]]; then
+        local pid
+        pid=$(profiles_get "$board_id" usb_product_id 2>/dev/null || echo "")
+        for dev in /dev/ttyACM* /dev/ttyUSB*; do
+          [[ -e "$dev" ]] || continue
+          local dev_pid
+          dev_pid=$(udevadm info --name="$dev" 2>/dev/null | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+          if [[ "$dev_pid" == "$pid" ]]; then
+            port="$dev"
+            break
+          fi
+        done
+      fi
+    fi
+
+    if [[ -n "$port" ]]; then
+      local upload_out
+      upload_out=$(arduino-cli upload --fqbn "$fqbn" --port "$port" "$sketch_dir" 2>&1) || true
+      if [[ $? -eq 0 ]]; then
+        upload_status="ok"
+        output_step ok "upload_${label}" "Uploaded to ${port}" >&2
+
+        # Serial verification if requested
+        if [[ "$ARG_VERIFY_SERIAL" == "true" ]]; then
+          verify_serial "$port" "$label" "$board_id"
+        fi
+      else
+        upload_status="error"
+        upload_detail="$upload_out"
+        output_step error "upload_${label}" "Upload failed to ${port}" "$upload_detail" >&2
+      fi
+    else
+      output_step skip "upload_${label}" "No port found for upload" >&2
+    fi
+  fi
+
+  # Cleanup
+  rm -rf "$tmp_dir"
+
+  jq -n \
+    --arg fqbn "$fqbn" \
+    --arg board_id "$board_id" \
+    --arg status "$status" \
+    --arg message "$message" \
+    --arg detail "$detail" \
+    --arg upload "$upload_status" \
+    '{fqbn: $fqbn, board_id: $board_id, status: $status, message: $message, upload: $upload} + (if $detail != "" then {detail: $detail} else {} end)'
+}
+
+# Board-type-aware serial verification after upload
+verify_serial() {
+  local port="$1" label="$2" board_id="$3"
+
+  local core
+  core=$(profiles_get "$board_id" core 2>/dev/null || echo "")
+  if [[ "$core" == "arduino:zephyr" ]]; then
+    output_step skip "serial_${label}" "Serial verify skipped (Zephyr boards use non-standard serial)" >&2
+    return
+  fi
+
+  local python=""
+  if [[ -f "$(pwd)/.venv/bin/python" ]]; then
+    python="$(pwd)/.venv/bin/python"
+  elif [[ -f "${ARDCONFIG_VENV_PATH:-.venv}/bin/python" ]]; then
+    python="${ARDCONFIG_VENV_PATH:-.venv}/bin/python"
+  else
+    output_step skip "serial_${label}" "Serial verify skipped (no venv with pyserial)" >&2
+    return
+  fi
+
+  output_step info "serial_${label}" "Waiting for serial output on ${port}..." >&2
+
+  local serial_out
+  serial_out=$(timeout 10 "$python" -c "
+import serial, time, sys
+try:
+    ser = serial.Serial('${port}', 115200, timeout=1)
+    ser.dtr = False
+    time.sleep(0.3)
+    ser.dtr = True
+    time.sleep(2)
+    start = time.time()
+    while time.time() - start < 6:
+        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        if 'ardconfig' in line.lower():
+            print(line)
+            sys.exit(0)
+    sys.exit(1)
+except Exception as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null) || true
+
+  if [[ -n "$serial_out" && "$serial_out" == *"ardconfig"* ]]; then
+    output_step ok "serial_${label}" "Serial verified: ${serial_out}" >&2
+  else
+    output_step warn "serial_${label}" "No serial verification response (board may still be running)" >&2
+  fi
+}
+
+main "$@"

@@ -1,0 +1,19 @@
+{
+  "id": "nano",
+  "name": "Arduino Nano",
+  "fqbn": "arduino:avr:nano",
+  "core": "arduino:avr",
+  "core_url": "",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "0058",
+  "usb_alt_chips": [
+    {"vendor_id": "1a86", "product_id": "7523", "chip": "CH340"},
+    {"vendor_id": "0403", "product_id": "6001", "chip": "FTDI FT232"}
+  ],
+  "usb_driver": "ch341-uart",
+  "serial_pattern": "/dev/ttyUSB*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "Classic AVR-based Nano. Many clones use CH340 or FTDI chips (vendor ID 1a86 or 0403 instead of 2341). Serial port is typically /dev/ttyUSB* not /dev/ttyACM*."
+}

@@ -1,0 +1,56 @@
+{
+  "name": "security-sentinel",
+  "description": "Reviews application security with threat modeling, vulnerability assessment, and remediation guidance.",
+  "prompt": "file://../prompts/security-sentinel.md",
+  "allowedTools": [
+    "read",
+    "glob",
+    "grep"
+  ],
+  "toolsSettings": {
+    "write": {
+      "allowedPaths": [
+        "spec/security.md"
+      ]
+    },
+    "shell": {
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../steering/**/*.md"
+  ],
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "shell",
+        "command": ".kiro/hooks/dangerous-command-blocker.sh"
+      },
+      {
+        "matcher": "read",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      },
+      {
+        "matcher": "write",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      },
+      {
+        "matcher": "shell",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      }
+    ]
+  },
+  "tools": [
+    "read",
+    "write",
+    "glob",
+    "grep",
+    "shell",
+    "@andes-mcp",
+    "@builder-mcp",
+    "@wwpp-mcp",
+    "@aws-outlook-mcp",
+    "@enterprise-asana-mcp"
+  ],
+  "useLegacyMcpJson": true
+}

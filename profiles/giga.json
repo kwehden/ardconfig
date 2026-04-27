@@ -1,0 +1,15 @@
+{
+  "id": "giga",
+  "name": "Arduino Giga R1 WiFi",
+  "fqbn": "arduino:mbed_giga:giga",
+  "core": "arduino:mbed_giga",
+  "core_url": "",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "0266",
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "Dual-core STM32H747XI (Cortex-M7 + M4). Giga Display Shield (ASX00039) attaches to this board."
+}

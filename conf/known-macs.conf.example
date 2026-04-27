@@ -1,0 +1,7 @@
+# Known Arduino board MAC addresses for network discovery
+# Used in environments with MAC-based WiFi registration (e.g., unfabric networks)
+#
+# Format: MAC_ADDRESS BOARD_ID LABEL
+# Example:
+# DA:E3:4A:01:23:45 uno-q "Lab Uno Q #1"
+# 2C:AB:33:67:89:AB r4wifi "Bench R4 WiFi"

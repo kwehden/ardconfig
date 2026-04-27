@@ -1,0 +1,15 @@
+{
+  "id": "uno-q",
+  "name": "Arduino Uno Q",
+  "fqbn": "arduino:zephyr:unoq",
+  "core": "arduino:zephyr",
+  "core_url": "https://downloads.arduino.cc/packages/package_zephyr_index.json",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "0078",
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": true,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": 50,
+  "notes": "Zephyr core is BETA. Requires bootloader burn on first use (double-click RESET)."
+}

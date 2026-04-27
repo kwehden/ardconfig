@@ -1,0 +1,327 @@
+#!/usr/bin/env bash
+# ardconfig-setup — Configure system for Arduino development
+# Covers: system access, tool installation, Python env, network discovery deps
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+source "${SCRIPT_DIR}/../lib/output.sh"
+source "${SCRIPT_DIR}/../lib/board-profiles.sh"
+
+usage() {
+  cat <<EOF
+Usage: ardconfig-setup [OPTIONS]
+
+Configure an Ubuntu system for Arduino development.
+Hardware does NOT need to be connected — install board cores in advance.
+Setup is idempotent: safe to run repeatedly, and to add boards incrementally.
+
+Options:
+  --boards BOARDS   Comma-separated board IDs to install (uno-q,r4wifi,giga)
+                    Default: all boards
+  --json            Output JSON instead of human-readable text
+  --quiet, -q       Suppress informational output
+  --non-interactive Run without prompts (for CI/agent use)
+  --help, -h        Show this help
+
+Exit codes:
+  0  Success
+  1  General failure
+  2  Missing prerequisites (no sudo, no internet)
+  3  Hardware not found
+  4  Partial success
+EOF
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$ARG_HELP" == "true" ]]; then usage; exit 0; fi
+  load_config
+  output_init "$(get_output_format)" "$ARG_QUIET"
+
+  if ! profiles_load; then
+    output_step error profiles_load "Failed to load board profiles (is jq installed?)"
+    output_result "$EXIT_FAIL"
+    exit "$EXIT_FAIL"
+  fi
+
+  local had_errors=false
+  local needs_apt=()
+
+  # --- FR-1: System access ---
+  setup_dialout
+  setup_udev
+
+  # --- Collect apt packages needed ---
+  collect_apt_packages needs_apt
+
+  # --- Install apt packages in one shot ---
+  if [[ ${#needs_apt[@]} -gt 0 ]]; then
+    install_apt_packages "${needs_apt[@]}"
+  fi
+
+  # --- FR-2: Tool installation ---
+  setup_arduino_cli
+  
+  # --- Auto-detect connected boards and merge with --boards selection ---
+  auto_detect_boards
+
+  setup_board_cores
+
+  # --- FR-3: Python environment ---
+  setup_python_env
+
+  # --- Verify serial access (FR-1.4) ---
+  verify_serial_access
+
+  # --- Emit result ---
+  local has_errors has_warns
+  has_errors=$(echo "$_OUTPUT_STEPS" | jq '[.[] | select(.status == "error")] | length')
+  has_warns=$(echo "$_OUTPUT_STEPS" | jq '[.[] | select(.status == "warn")] | length')
+
+  if [[ "$has_errors" -gt 0 ]]; then
+    output_result "$EXIT_PARTIAL"
+    exit "$EXIT_PARTIAL"
+  else
+    output_result "$EXIT_OK"
+    exit "$EXIT_OK"
+  fi
+}
+
+setup_dialout() {
+  if user_in_group dialout; then
+    output_step skip dialout_group "User already in dialout group"
+  else
+    require_sudo
+    run_sudo usermod -aG dialout "$USER" 2>/dev/null \
+      && output_step ok dialout_group "Added user to dialout group" \
+      || output_step error dialout_group "Failed to add user to dialout group"
+    output_step warn dialout_logout "Logout/login required for dialout group to take full effect (udev rule provides immediate access)"
+  fi
+}
+
+setup_udev() {
+  local src="${ARDCONFIG_UDEV}/99-arduino.rules"
+  local dst="/etc/udev/rules.d/99-arduino.rules"
+
+  if [[ -f "$dst" ]] && diff -q "$src" "$dst" &>/dev/null; then
+    output_step skip udev_rules "udev rules already installed"
+  else
+    require_sudo
+    run_sudo cp "$src" "$dst" 2>/dev/null \
+      && run_sudo udevadm control --reload-rules 2>/dev/null \
+      && run_sudo udevadm trigger 2>/dev/null \
+      && output_step ok udev_rules "Installed udev rules and reloaded" \
+      || output_step error udev_rules "Failed to install udev rules"
+  fi
+}
+
+collect_apt_packages() {
+  local -n pkgs=$1
+
+  # jq (needed by profiles)
+  command -v jq &>/dev/null || pkgs+=(jq)
+
+  # Python (FR-3.2)
+  dpkg -s python3-venv &>/dev/null || pkgs+=(python3-venv)
+  dpkg -s python3-pip &>/dev/null || pkgs+=(python3-pip)
+
+  # Network discovery (FR-5.1)
+  command -v avahi-browse &>/dev/null || pkgs+=(avahi-utils)
+  command -v nmap &>/dev/null || pkgs+=(nmap)
+}
+
+install_apt_packages() {
+  local pkgs=("$@")
+  require_sudo
+  local pkg_list="${pkgs[*]}"
+  if run_sudo apt-get update -qq 2>/dev/null && \
+     run_sudo apt-get install -y -qq "${pkgs[@]}" 2>/dev/null; then
+    output_step ok apt_packages "Installed: ${pkg_list}"
+  else
+    output_step error apt_packages "Failed to install: ${pkg_list}"
+  fi
+}
+
+setup_arduino_cli() {
+  if command -v arduino-cli &>/dev/null; then
+    local ver
+    ver=$(arduino-cli version 2>/dev/null | head -1)
+    output_step skip arduino_cli_install "arduino-cli already installed (${ver})"
+  else
+    local install_dir="${HOME}/.local/bin"
+    mkdir -p "$install_dir"
+    # Try official install script first, fall back to direct download
+    local installed=false
+    if curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR="$install_dir" sh 2>/dev/null; then
+      installed=true
+    else
+      # Direct download fallback
+      local tmp_tar
+      tmp_tar=$(mktemp /tmp/arduino-cli-XXXXXX.tar.gz)
+      if curl -fsSL https://downloads.arduino.cc/arduino-cli/arduino-cli_latest_Linux_64bit.tar.gz -o "$tmp_tar" 2>/dev/null; then
+        tar xzf "$tmp_tar" -C "$install_dir" arduino-cli 2>/dev/null && installed=true
+        rm -f "$tmp_tar"
+      fi
+    fi
+    if [[ "$installed" == "true" ]]; then
+      output_step ok arduino_cli_install "Installed arduino-cli to ${install_dir}"
+    else
+      output_step error arduino_cli_install "Failed to install arduino-cli"
+      return
+    fi
+
+    # Check PATH
+    if ! echo "$PATH" | tr ':' '\n' | grep -qx "$install_dir"; then
+      output_step warn arduino_cli_path "~/.local/bin is not on PATH. Add to your shell profile: export PATH=\"\${HOME}/.local/bin:\${PATH}\""
+      export PATH="${install_dir}:${PATH}"
+    fi
+  fi
+
+  # Configure additional board manager URLs (FR-2.2)
+  local urls
+  urls=$(profiles_core_urls "$ARG_BOARDS")
+  if [[ -n "$urls" ]]; then
+    while IFS= read -r url; do
+      local current
+      current=$(arduino-cli config get board_manager.additional_urls 2>/dev/null || echo "")
+      if echo "$current" | grep -qF "$url"; then
+        output_step skip board_manager_url "Board manager URL already configured: ${url}"
+      else
+        arduino-cli config add board_manager.additional_urls "$url" 2>/dev/null \
+          && output_step ok board_manager_url "Added board manager URL: ${url}" \
+          || output_step error board_manager_url "Failed to add URL: ${url}"
+      fi
+    done <<< "$urls"
+  fi
+
+  # Update core index
+  arduino-cli core update-index 2>/dev/null \
+    && output_step ok core_index "Updated board core index" \
+    || output_step warn core_index "Failed to update core index (may work offline)"
+}
+
+setup_board_cores() {
+  local selected
+  selected=$(profiles_filter "$ARG_BOARDS")
+  local count
+  count=$(echo "$selected" | jq 'length')
+
+  for i in $(seq 0 $((count - 1))); do
+    local board_id core
+    board_id=$(echo "$selected" | jq -r ".[$i].id")
+    core=$(echo "$selected" | jq -r ".[$i].core")
+
+    if arduino-cli core list 2>/dev/null | grep -q "^${core}"; then
+      local ver
+      ver=$(arduino-cli core list 2>/dev/null | grep "^${core}" | awk '{print $2}')
+      output_step skip "core_install_${board_id}" "Core ${core} already installed (${ver})"
+    else
+      output_step info "core_install_${board_id}" "Installing core ${core} (this may take a few minutes)..."
+      local install_out
+      install_out=$(arduino-cli core install "$core" 2>&1)
+      if [[ $? -eq 0 ]]; then
+        output_step ok "core_install_${board_id}" "Installed core: ${core}"
+      else
+        output_step error "core_install_${board_id}" "Failed to install core: ${core}" "$install_out"
+      fi
+    fi
+  done
+}
+
+auto_detect_boards() {
+  # Scan connected hardware and add their board IDs to ARG_BOARDS
+  local detected_ids=""
+  for dev in /dev/ttyACM* /dev/ttyUSB*; do
+    [[ -e "$dev" ]] || continue
+    local info vid pid
+    info=$(udevadm info --name="$dev" 2>/dev/null || echo "")
+    vid=$(echo "$info" | grep -oP 'ID_VENDOR_ID=\K.*' || echo "")
+    pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+    [[ -z "$vid" ]] && continue
+    local match
+    match=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+    if [[ -n "$match" ]]; then
+      detected_ids="${detected_ids:+${detected_ids},}${match}"
+    fi
+  done
+
+  if [[ -n "$detected_ids" ]]; then
+    # Merge detected boards with explicitly requested boards
+    local merged="$ARG_BOARDS"
+    IFS=',' read -ra det_arr <<< "$detected_ids"
+    for did in "${det_arr[@]}"; do
+      if [[ -z "$merged" ]] || ! echo ",$merged," | grep -q ",${did},"; then
+        merged="${merged:+${merged},}${did}"
+        output_step info "auto_detect" "Detected ${did} — adding to install list"
+      fi
+    done
+    ARG_BOARDS="$merged"
+  fi
+}
+
+setup_python_env() {
+  # FR-3.1: Verify Python 3.10+
+  local py_ver
+  if ! py_ver=$(python3 --version 2>/dev/null | grep -oP '\d+\.\d+'); then
+    output_step error python_version "Python 3 not found"
+    return
+  fi
+  local major minor
+  major=$(echo "$py_ver" | cut -d. -f1)
+  minor=$(echo "$py_ver" | cut -d. -f2)
+  if [[ "$major" -lt 3 || ("$major" -eq 3 && "$minor" -lt 10) ]]; then
+    output_step error python_version "Python 3.10+ required, found ${py_ver}"
+    return
+  fi
+  output_step ok python_version "Python ${py_ver} found"
+
+  # FR-3.3: Create venv
+  local venv_path="${ARDCONFIG_VENV_PATH:-.venv}"
+  # venv is created relative to the caller's working directory (the project root)
+  local abs_venv_path
+  abs_venv_path="$(pwd)/${venv_path}"
+  if [[ -d "$abs_venv_path" && -f "$abs_venv_path/bin/python" ]]; then
+    output_step skip python_venv "Virtual environment already exists at ${abs_venv_path}"
+  else
+    if python3 -m venv "$abs_venv_path" 2>/dev/null; then
+      output_step ok python_venv "Created virtual environment at ${abs_venv_path}"
+    else
+      output_step error python_venv "Failed to create virtual environment"
+      return
+    fi
+  fi
+
+  # FR-3.4: Install pyserial
+  local packages="${ARDCONFIG_PYTHON_PACKAGES:-pyserial}"
+  if "${abs_venv_path}/bin/pip" show pyserial &>/dev/null; then
+    output_step skip python_packages "pyserial already installed in venv"
+  else
+    if "${abs_venv_path}/bin/pip" install --quiet $packages 2>/dev/null; then
+      output_step ok python_packages "Installed Python packages: ${packages}"
+    else
+      output_step error python_packages "Failed to install Python packages"
+    fi
+  fi
+}
+
+verify_serial_access() {
+  local found=false
+  for dev in /dev/ttyACM* /dev/ttyUSB*; do
+    [[ -e "$dev" ]] || continue
+    local vid
+    vid=$(udevadm info --name="$dev" 2>/dev/null | grep -oP 'ID_VENDOR_ID=\K.*' || echo "")
+    [[ "$vid" == "2341" ]] || continue
+    found=true
+    if [[ -r "$dev" && -w "$dev" ]]; then
+      output_step ok "serial_access_${dev##*/}" "Serial port ${dev} is accessible"
+    else
+      output_step warn "serial_access_${dev##*/}" "Serial port ${dev} not yet accessible (replug device or logout/login)"
+    fi
+  done
+  if [[ "$found" == "false" ]]; then
+    output_step info serial_access "No Arduino devices currently connected (this is OK for setup)"
+  fi
+}
+
+main "$@"

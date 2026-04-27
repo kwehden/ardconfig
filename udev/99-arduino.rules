@@ -1,0 +1,8 @@
+# Arduino devices — grant all users access (ardconfig)
+# Installed by ardconfig-setup to /etc/udev/rules.d/99-arduino.rules
+SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", MODE="0666"
+SUBSYSTEM=="usb", ATTRS{idVendor}=="2341", MODE="0666"
+# CH340 USB-to-serial (common on Nano clones)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="7523", MODE="0666"
+# FTDI FT232 USB-to-serial (common on Nano clones)
+SUBSYSTEM=="tty", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE="0666"

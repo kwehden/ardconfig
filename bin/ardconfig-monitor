@@ -1,0 +1,313 @@
+#!/usr/bin/env bash
+# ardconfig-monitor — Persistent device monitor and auto-onboarding
+# Watches for Arduino boards connecting/disconnecting and auto-preps new devices.
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+source "${SCRIPT_DIR}/../lib/output.sh"
+source "${SCRIPT_DIR}/../lib/board-profiles.sh"
+
+POLL_INTERVAL=3
+KNOWN_DEVICES_FILE="/tmp/ardconfig-monitor-known.json"
+
+usage() {
+  cat <<EOF
+Usage: ardconfig-monitor [OPTIONS]
+
+Persistent monitor that watches for Arduino boards and auto-onboards them.
+Stays running in a shell — detects new devices, installs missing cores,
+compiles and uploads a verification sketch, and reports status.
+
+Options:
+  --poll SECONDS    Polling interval (default: 3)
+  --upload          Auto-upload blink sketch to new devices
+  --verify-serial   After upload, verify serial output
+  --json            Output events as JSON lines (for agent consumption)
+  --quiet, -q       Suppress informational output
+  --help, -h        Show this help
+
+Press Ctrl+C to stop.
+
+Exit codes:
+  0  Clean shutdown
+  1  General failure
+  2  Missing prerequisites
+EOF
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$ARG_HELP" == "true" ]]; then usage; exit 0; fi
+  load_config
+
+  # Parse --poll from extra args
+  local i=0
+  while [[ $i -lt ${#ARG_EXTRA[@]} ]]; do
+    case "${ARG_EXTRA[$i]:-}" in
+      --poll) i=$((i + 1)); POLL_INTERVAL="${ARG_EXTRA[$i]:-$POLL_INTERVAL}" ;;
+    esac
+    i=$((i + 1))
+  done
+
+  # Preflight
+  if ! command -v arduino-cli &>/dev/null; then
+    echo "[ERROR] arduino-cli not found. Run ardconfig-setup first." >&2
+    exit "$EXIT_PREREQ"
+  fi
+
+  if ! profiles_load 2>/dev/null; then
+    echo "[ERROR] Failed to load board profiles." >&2
+    exit "$EXIT_FAIL"
+  fi
+
+  # Initialize known devices
+  echo "[]" > "$KNOWN_DEVICES_FILE"
+
+  # Trap for clean shutdown
+  trap cleanup EXIT INT TERM
+  
+  echo "[$(date -Iseconds)] [OK]    ardconfig monitor started (polling every ${POLL_INTERVAL}s, Ctrl+C to stop)"
+
+  # Initial scan
+  poll_devices
+
+  # Main loop
+  while true; do
+    sleep "$POLL_INTERVAL"
+    poll_devices
+  done
+}
+
+cleanup() {
+  emit_event "monitor_stop" "ok" "ardconfig monitor stopped"
+  rm -f "$KNOWN_DEVICES_FILE"
+}
+
+emit_event() {
+  local name="$1" status="$2" message="$3" detail="${4:-}"
+  local timestamp
+  timestamp=$(date -Iseconds)
+
+  if [[ "$ARG_JSON" == "true" ]]; then
+    jq -n -c \
+      --arg ts "$timestamp" \
+      --arg n "$name" \
+      --arg s "$status" \
+      --arg m "$message" \
+      --arg d "$detail" \
+      '{timestamp: $ts, event: $n, status: $s, message: $m} + (if $d != "" then {detail: $d} else {} end)'
+  else
+    local tag
+    case "$status" in
+      ok)    tag="[OK]   " ;;
+      skip)  tag="[SKIP] " ;;
+      warn)  tag="[WARN] " ;;
+      error) tag="[ERROR]" ;;
+      info)  tag="[INFO] " ;;
+      new)   tag="[NEW]  " ;;
+      gone)  tag="[GONE] " ;;
+      *)     tag="[????] " ;;
+    esac
+    if [[ "$ARG_QUIET" != "true" || "$status" == "error" || "$status" == "new" || "$status" == "gone" ]]; then
+      echo "${timestamp} ${tag} ${message}"
+    fi
+  fi
+}
+
+poll_devices() {
+  local current_devices="[]"
+
+  # Scan all serial devices
+  for dev in /dev/ttyACM* /dev/ttyUSB*; do
+    [[ -e "$dev" ]] || continue
+    local info vid pid
+    info=$(udevadm info --name="$dev" 2>/dev/null || echo "")
+    vid=$(echo "$info" | grep -oP 'ID_VENDOR_ID=\K.*' || echo "")
+    pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+    [[ -z "$vid" ]] && continue
+
+    # Match against profiles (primary + alt chips)
+    local board_id=""
+    if [[ "$vid" == "2341" ]]; then
+      board_id=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+    else
+      board_id=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+    fi
+    [[ -z "$board_id" ]] && continue
+
+    local serial_num
+    serial_num=$(echo "$info" | grep -oP 'ID_SERIAL_SHORT=\K.*' || echo "none")
+    local device_key="${board_id}:${serial_num}:${dev}"
+
+    local entry
+    entry=$(jq -n -c \
+      --arg key "$device_key" \
+      --arg dev "$dev" \
+      --arg bid "$board_id" \
+      --arg ser "$serial_num" \
+      '{key: $key, device: $dev, board_id: $bid, serial: $ser}')
+    current_devices=$(echo "$current_devices" | jq --argjson e "$entry" '. + [$e]')
+  done
+
+  local known_devices
+  known_devices=$(cat "$KNOWN_DEVICES_FILE" 2>/dev/null || echo "[]")
+
+  # Detect new devices
+  local current_keys known_keys
+  current_keys=$(echo "$current_devices" | jq -r '.[].key' | sort)
+  known_keys=$(echo "$known_devices" | jq -r '.[].key' | sort)
+
+  # New devices (in current but not in known)
+  while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+    if ! echo "$known_keys" | grep -qxF "$key"; then
+      local board_id dev_path serial_num
+      board_id=$(echo "$current_devices" | jq -r --arg k "$key" '.[] | select(.key == $k) | .board_id')
+      dev_path=$(echo "$current_devices" | jq -r --arg k "$key" '.[] | select(.key == $k) | .device')
+      serial_num=$(echo "$current_devices" | jq -r --arg k "$key" '.[] | select(.key == $k) | .serial')
+      local board_name
+      board_name=$(profiles_get "$board_id" name 2>/dev/null || echo "$board_id")
+
+      emit_event "device_connected" "new" "${board_name} on ${dev_path} (serial: ${serial_num})"
+      onboard_device "$board_id" "$dev_path"
+    fi
+  done <<< "$current_keys"
+
+  # Departed devices (in known but not in current)
+  while IFS= read -r key; do
+    [[ -z "$key" ]] && continue
+    if ! echo "$current_keys" | grep -qxF "$key"; then
+      local board_id dev_path
+      board_id=$(echo "$known_devices" | jq -r --arg k "$key" '.[] | select(.key == $k) | .board_id')
+      dev_path=$(echo "$known_devices" | jq -r --arg k "$key" '.[] | select(.key == $k) | .device')
+      local board_name
+      board_name=$(profiles_get "$board_id" name 2>/dev/null || echo "$board_id")
+
+      emit_event "device_disconnected" "gone" "${board_name} removed from ${dev_path}"
+    fi
+  done <<< "$known_keys"
+
+  # Update known devices
+  echo "$current_devices" > "$KNOWN_DEVICES_FILE"
+}
+
+onboard_device() {
+  local board_id="$1" port="$2"
+  local board_name core fqbn
+  board_name=$(profiles_get "$board_id" name 2>/dev/null || echo "$board_id")
+  core=$(profiles_get "$board_id" core 2>/dev/null || echo "")
+  fqbn=$(profiles_get "$board_id" fqbn 2>/dev/null || echo "")
+
+  # Check if core is installed
+  if ! arduino-cli core list 2>/dev/null | grep -q "^${core}"; then
+    emit_event "core_install" "info" "Installing core ${core} for ${board_name}..."
+
+    # Ensure board manager URL is configured
+    local core_url
+    core_url=$(profiles_get "$board_id" core_url 2>/dev/null || echo "")
+    if [[ -n "$core_url" ]]; then
+      local current
+      current=$(arduino-cli config get board_manager.additional_urls 2>/dev/null || echo "")
+      if ! echo "$current" | grep -qF "$core_url"; then
+        arduino-cli config add board_manager.additional_urls "$core_url" 2>/dev/null
+        arduino-cli core update-index 2>/dev/null
+      fi
+    fi
+
+    if arduino-cli core install "$core" 2>/dev/null; then
+      emit_event "core_install" "ok" "Installed core ${core}"
+    else
+      emit_event "core_install" "error" "Failed to install core ${core}"
+      return
+    fi
+  else
+    emit_event "core_check" "ok" "Core ${core} ready"
+  fi
+
+  # Compile blink
+  local led_pin
+  led_pin=$(profiles_get "$board_id" blink_led_pin 2>/dev/null || echo "LED_BUILTIN")
+  local tmp_dir
+  tmp_dir=$(mktemp -d "/tmp/ardconfig-monitor-XXXXXX")
+  local sketch_dir="${tmp_dir}/blink"
+  mkdir -p "$sketch_dir"
+  cp "${ARDCONFIG_TEMPLATES}/blink.ino" "${sketch_dir}/blink.ino"
+
+  local extra_flags=""
+  if [[ -n "$led_pin" && "$led_pin" != "LED_BUILTIN" ]]; then
+    extra_flags="--build-property compiler.cpp.extra_flags=-DARDCONFIG_LED_PIN=${led_pin}"
+  fi
+
+  if arduino-cli compile --fqbn "$fqbn" $extra_flags "$sketch_dir" 2>/dev/null; then
+    emit_event "compile" "ok" "Compiled blink for ${board_name}"
+  else
+    emit_event "compile" "error" "Compilation failed for ${board_name}"
+    rm -rf "$tmp_dir"
+    return
+  fi
+
+  # Upload if requested
+  if [[ "$ARG_UPLOAD" == "true" ]]; then
+    if arduino-cli upload --fqbn "$fqbn" --port "$port" "$sketch_dir" 2>/dev/null; then
+      emit_event "upload" "ok" "Uploaded blink to ${board_name} on ${port}"
+
+      # Serial verification if requested
+      if [[ "$ARG_VERIFY_SERIAL" == "true" ]]; then
+        verify_serial_monitor "$port" "$board_name" "$board_id"
+      fi
+    else
+      emit_event "upload" "error" "Upload failed to ${board_name} on ${port}"
+    fi
+  fi
+
+  rm -rf "$tmp_dir"
+}
+
+verify_serial_monitor() {
+  local port="$1" label="$2" board_id="$3"
+
+  local core
+  core=$(profiles_get "$board_id" core 2>/dev/null || echo "")
+  if [[ "$core" == "arduino:zephyr" ]]; then
+    emit_event "serial_verify" "skip" "Skipped for ${label} (Zephyr non-standard serial)"
+    return
+  fi
+
+  local python=""
+  if [[ -f "$(pwd)/.venv/bin/python" ]]; then
+    python="$(pwd)/.venv/bin/python"
+  else
+    emit_event "serial_verify" "skip" "Skipped (no pyserial venv)"
+    return
+  fi
+
+  local serial_out
+  serial_out=$(timeout 10 "$python" -c "
+import serial, time, sys
+try:
+    ser = serial.Serial('${port}', 115200, timeout=1)
+    ser.dtr = False
+    time.sleep(0.3)
+    ser.dtr = True
+    time.sleep(2)
+    start = time.time()
+    while time.time() - start < 6:
+        line = ser.readline().decode('utf-8', errors='ignore').strip()
+        if 'ardconfig' in line.lower():
+            print(line)
+            sys.exit(0)
+    sys.exit(1)
+except Exception as e:
+    print(str(e), file=sys.stderr)
+    sys.exit(1)
+" 2>/dev/null) || true
+
+  if [[ -n "$serial_out" && "$serial_out" == *"ardconfig"* ]]; then
+    emit_event "serial_verify" "ok" "${label}: ${serial_out}"
+  else
+    emit_event "serial_verify" "warn" "${label}: no verification response (board may still be running)"
+  fi
+}
+
+main "$@"

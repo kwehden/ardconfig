@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# ardconfig-detect — Detect connected Arduino boards via USB
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+source "${SCRIPT_DIR}/../lib/output.sh"
+
+# Try to load profiles (degraded mode if jq missing)
+_HAS_PROFILES=false
+if command -v jq &>/dev/null; then
+  source "${SCRIPT_DIR}/../lib/board-profiles.sh"
+  if profiles_load 2>/dev/null; then
+    _HAS_PROFILES=true
+  fi
+fi
+
+usage() {
+  cat <<EOF
+Usage: ardconfig-detect [OPTIONS]
+
+Detect Arduino boards connected via USB.
+
+Options:
+  --json            Output JSON instead of human-readable text
+  --quiet, -q       Suppress informational output
+  --help, -h        Show this help
+
+Exit codes:
+  0  Boards detected
+  1  General failure
+  3  No boards detected
+EOF
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$ARG_HELP" == "true" ]]; then usage; exit 0; fi
+  output_init "$(get_output_format)" "$ARG_QUIET"
+
+  if [[ "$_HAS_PROFILES" == "false" ]]; then
+    output_step warn profiles_unavailable "Board profiles not loaded (jq missing or profiles not found). Running in degraded mode."
+  fi
+
+  local boards_json="[]"
+  local found=false
+
+  for dev in /dev/ttyACM* /dev/ttyUSB*; do
+    [[ -e "$dev" ]] || continue
+
+    local info
+    info=$(udevadm info --name="$dev" 2>/dev/null || echo "")
+    [[ -z "$info" ]] && continue
+
+    local vid pid model serial
+    vid=$(echo "$info" | grep -oP 'ID_VENDOR_ID=\K.*' || echo "")
+
+    # Match: either Arduino vendor ID or alternate chip match via profiles
+    local is_arduino=false
+    if [[ "$vid" == "2341" ]]; then
+      is_arduino=true
+    elif [[ "$_HAS_PROFILES" == "true" && -n "$vid" ]]; then
+      pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+      local alt_match
+      alt_match=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+      [[ -n "$alt_match" ]] && is_arduino=true
+    fi
+    [[ "$is_arduino" == "true" ]] || continue
+
+    found=true
+    pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+    model=$(echo "$info" | grep -oP 'ID_MODEL=\K.*' || echo "")
+    serial=$(echo "$info" | grep -oP 'ID_SERIAL_SHORT=\K.*' || echo "")
+
+    local accessible=false
+    [[ -r "$dev" && -w "$dev" ]] && accessible=true
+
+    # Enrich from profiles if available
+    local board_id="" board_name="" fqbn="" notes=""
+    if [[ "$_HAS_PROFILES" == "true" ]]; then
+      board_id=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+      if [[ -n "$board_id" ]]; then
+        board_name=$(profiles_get "$board_id" name 2>/dev/null || echo "")
+        fqbn=$(profiles_get "$board_id" fqbn 2>/dev/null || echo "")
+        notes=$(profiles_get "$board_id" notes 2>/dev/null || echo "")
+      fi
+    fi
+
+    # Use USB model string as fallback name
+    [[ -z "$board_name" ]] && board_name="$model"
+
+    local board_entry
+    board_entry=$(jq -n \
+      --arg dev "$dev" \
+      --arg vid "$vid" \
+      --arg pid "$pid" \
+      --arg name "$board_name" \
+      --arg fqbn "$fqbn" \
+      --arg board_id "$board_id" \
+      --arg serial "$serial" \
+      --argjson accessible "$accessible" \
+      --arg notes "$notes" \
+      '{device: $dev, vendor_id: $vid, product_id: $pid, name: $name, fqbn: $fqbn, board_id: $board_id, serial: $serial, accessible: $accessible} + (if $notes != "" then {notes: $notes} else {} end)' 2>/dev/null)
+
+    if [[ -n "$board_entry" ]]; then
+      boards_json=$(echo "$boards_json" | jq --argjson b "$board_entry" '. + [$b]')
+    fi
+
+    local access_str="accessible"
+    [[ "$accessible" == "false" ]] && access_str="NOT accessible (run ardconfig-setup)"
+    output_step ok "board_${dev##*/}" "${board_name:-Unknown} on ${dev} [${fqbn:-unknown FQBN}] — ${access_str}"
+  done
+
+  if [[ "$found" == "false" ]]; then
+    output_step error no_boards "No Arduino boards detected. Check USB connection."
+    local extra
+    extra=$(jq -n --argjson b "$boards_json" '{boards: $b}')
+    output_result "$EXIT_NO_HW" "$extra"
+    exit "$EXIT_NO_HW"
+  fi
+
+  local extra
+  extra=$(jq -n --argjson b "$boards_json" '{boards: $b}')
+  output_result "$EXIT_OK" "$extra"
+  exit "$EXIT_OK"
+}
+
+main "$@"

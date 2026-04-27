@@ -1,0 +1,52 @@
+{
+  "name": "code-reviewer",
+  "description": "Performs senior-level read-only review of diffs against specs for correctness, maintainability, and risk.",
+  "prompt": "file://../prompts/code-reviewer.md",
+  "allowedTools": [
+    "read",
+    "glob",
+    "grep"
+  ],
+  "toolsSettings": {
+    "shell": {
+      "allowedCommands": [
+        "git diff",
+        "git log",
+        "git status",
+        "git show"
+      ],
+      "autoAllowReadonly": true
+    }
+  },
+  "resources": [
+    "file://../steering/**/*.md"
+  ],
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "shell",
+        "command": ".kiro/hooks/dangerous-command-blocker.sh"
+      },
+      {
+        "matcher": "read",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      },
+      {
+        "matcher": "shell",
+        "command": ".kiro/hooks/sensitive-file-protector.sh"
+      }
+    ]
+  },
+  "tools": [
+    "read",
+    "glob",
+    "grep",
+    "shell",
+    "@andes-mcp",
+    "@builder-mcp",
+    "@wwpp-mcp",
+    "@aws-outlook-mcp",
+    "@enterprise-asana-mcp"
+  ],
+  "useLegacyMcpJson": true
+}

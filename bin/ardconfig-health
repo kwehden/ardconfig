@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# ardconfig-health — Run all health checks and produce a summary
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+source "${SCRIPT_DIR}/../lib/output.sh"
+
+usage() {
+  cat <<EOF
+Usage: ardconfig-health [OPTIONS]
+
+Run all ardconfig health checks and produce a summary report.
+
+Checks: system access, tools, Python, board detection, network deps, build verification.
+
+Options:
+  --boards BOARDS   Comma-separated board IDs to check (default: all)
+  --json            Output JSON instead of human-readable text
+  --quiet, -q       Suppress informational output
+  --help, -h        Show this help
+
+Exit codes:
+  0  All checks passed
+  1  One or more checks failed
+  4  Partial (some passed, some failed)
+EOF
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$ARG_HELP" == "true" ]]; then usage; exit 0; fi
+  load_config
+  output_init "$(get_output_format)" "$ARG_QUIET"
+
+  # --- System access checks ---
+  check_dialout_group
+  check_udev_rules
+  check_serial_permissions
+
+  # --- Tool checks ---
+  check_arduino_cli
+  check_board_cores
+  check_jq
+
+  # --- Python checks ---
+  check_python
+  check_venv
+
+  # --- Board detection ---
+  check_board_detection
+
+  # --- Network discovery deps ---
+  check_network_deps
+
+  # --- Build verification (compile only, no upload) ---
+  check_build_verification
+
+  # --- Emit result ---
+  local errors
+  errors=$(echo "$_OUTPUT_STEPS" | jq '[.[] | select(.status == "error")] | length')
+  local total
+  total=$(echo "$_OUTPUT_STEPS" | jq 'length')
+  local ok_count
+  ok_count=$(echo "$_OUTPUT_STEPS" | jq '[.[] | select(.status == "ok" or .status == "skip")] | length')
+
+  if [[ "$errors" -eq 0 ]]; then
+    output_result "$EXIT_OK"
+    exit "$EXIT_OK"
+  elif [[ "$ok_count" -gt 0 ]]; then
+    output_result "$EXIT_PARTIAL"
+    exit "$EXIT_PARTIAL"
+  else
+    output_result "$EXIT_FAIL"
+    exit "$EXIT_FAIL"
+  fi
+}
+
+check_dialout_group() {
+  if user_in_group dialout; then
+    output_step ok dialout "User is in dialout group"
+  else
+    output_step warn dialout "User is NOT in dialout group (run ardconfig-setup)"
+  fi
+}
+
+check_udev_rules() {
+  if [[ -f /etc/udev/rules.d/99-arduino.rules ]]; then
+    output_step ok udev "Arduino udev rules installed"
+  else
+    output_step error udev "Arduino udev rules not installed (run ardconfig-setup)"
+  fi
+}
+
+check_serial_permissions() {
+  local found=false
+  for dev in /dev/ttyACM* /dev/ttyUSB*; do
+    [[ -e "$dev" ]] || continue
+    local vid
+    vid=$(udevadm info --name="$dev" 2>/dev/null | grep -oP 'ID_VENDOR_ID=\K.*' || echo "")
+    [[ "$vid" == "2341" ]] || continue
+    found=true
+    if [[ -r "$dev" && -w "$dev" ]]; then
+      output_step ok "serial_${dev##*/}" "Serial port ${dev} accessible"
+    else
+      output_step error "serial_${dev##*/}" "Serial port ${dev} NOT accessible"
+    fi
+  done
+  if [[ "$found" == "false" ]]; then
+    output_step info serial "No Arduino USB devices connected"
+  fi
+}
+
+check_arduino_cli() {
+  if command -v arduino-cli &>/dev/null; then
+    local ver
+    ver=$(arduino-cli version 2>/dev/null | head -1)
+    output_step ok arduino_cli "${ver}"
+  else
+    output_step error arduino_cli "arduino-cli not installed (run ardconfig-setup)"
+  fi
+}
+
+check_board_cores() {
+  if ! command -v arduino-cli &>/dev/null; then return; fi
+
+  # Load profiles to know what cores to check
+  if command -v jq &>/dev/null; then
+    source "${SCRIPT_DIR}/../lib/board-profiles.sh"
+    if profiles_load 2>/dev/null; then
+      local selected
+      selected=$(profiles_filter "$ARG_BOARDS")
+      local count
+      count=$(echo "$selected" | jq 'length')
+      for i in $(seq 0 $((count - 1))); do
+        local board_id core
+        board_id=$(echo "$selected" | jq -r ".[$i].id")
+        core=$(echo "$selected" | jq -r ".[$i].core")
+        if arduino-cli core list 2>/dev/null | grep -q "^${core}"; then
+          local ver
+          ver=$(arduino-cli core list 2>/dev/null | grep "^${core}" | awk '{print $2}')
+          output_step ok "core_${board_id}" "Core ${core} installed (${ver})"
+        else
+          output_step error "core_${board_id}" "Core ${core} not installed"
+        fi
+      done
+    fi
+  fi
+}
+
+check_jq() {
+  if command -v jq &>/dev/null; then
+    output_step ok jq "jq installed ($(jq --version 2>/dev/null))"
+  else
+    output_step error jq "jq not installed (run ardconfig-setup)"
+  fi
+}
+
+check_python() {
+  local ver
+  if ver=$(python3 --version 2>/dev/null); then
+    output_step ok python "$ver"
+  else
+    output_step error python "Python 3 not found"
+  fi
+}
+
+check_venv() {
+  local venv_path="${ARDCONFIG_VENV_PATH:-.venv}"
+  if [[ -f "${venv_path}/bin/python" ]]; then
+    if "${venv_path}/bin/python" -c "import serial" 2>/dev/null; then
+      output_step ok venv "Virtual environment OK, pyserial installed"
+    else
+      output_step warn venv "Virtual environment exists but pyserial not installed"
+    fi
+  else
+    output_step error venv "Virtual environment not found at ${venv_path} (run ardconfig-setup)"
+  fi
+}
+
+check_board_detection() {
+  local detect_script="${SCRIPT_DIR}/ardconfig-detect"
+  if [[ ! -x "$detect_script" ]]; then
+    output_step skip board_detect "ardconfig-detect not found"
+    return
+  fi
+  local detect_out
+  detect_out=$("$detect_script" --json 2>/dev/null) || true
+  local count
+  count=$(echo "$detect_out" | jq '.boards | length' 2>/dev/null || echo "0")
+  if [[ "$count" -gt 0 ]]; then
+    output_step ok board_detect "${count} board(s) detected via USB"
+  else
+    output_step info board_detect "No boards detected via USB (connect a board to check)"
+  fi
+}
+
+check_network_deps() {
+  local all_ok=true
+  if command -v avahi-browse &>/dev/null; then
+    output_step ok avahi "avahi-utils installed"
+  else
+    output_step warn avahi "avahi-utils not installed (network discovery limited)"
+    all_ok=false
+  fi
+  if command -v nmap &>/dev/null; then
+    output_step ok nmap "nmap installed"
+  else
+    output_step warn nmap "nmap not installed (network discovery limited)"
+    all_ok=false
+  fi
+}
+
+check_build_verification() {
+  if ! command -v arduino-cli &>/dev/null; then
+    output_step skip build "Skipping build check (arduino-cli not installed)"
+    return
+  fi
+
+  local verify_script="${SCRIPT_DIR}/ardconfig-verify"
+  if [[ ! -x "$verify_script" ]]; then
+    output_step skip build "ardconfig-verify not found"
+    return
+  fi
+
+  local boards_flag=""
+  [[ -n "$ARG_BOARDS" ]] && boards_flag="--boards $ARG_BOARDS"
+
+  local verify_out
+  verify_out=$("$verify_script" --json $boards_flag 2>/dev/null) || true
+  local errors
+  errors=$(echo "$verify_out" | jq '[.results[]? | select(.status == "error")] | length' 2>/dev/null || echo "0")
+  local total
+  total=$(echo "$verify_out" | jq '.results | length' 2>/dev/null || echo "0")
+
+  if [[ "$total" -eq 0 ]]; then
+    output_step skip build "No cores installed to verify"
+  elif [[ "$errors" -eq 0 ]]; then
+    output_step ok build "All ${total} board(s) compile successfully"
+  else
+    output_step error build "${errors}/${total} board(s) failed compilation"
+  fi
+}
+
+main "$@"

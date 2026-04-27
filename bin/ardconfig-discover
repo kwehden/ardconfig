@@ -1,0 +1,250 @@
+#!/usr/bin/env bash
+# ardconfig-discover — Discover Arduino boards on the local network
+# Fallback chain: mDNS → known MACs → ARP OUI scan → nmap
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+source "${SCRIPT_DIR}/../lib/output.sh"
+source "${SCRIPT_DIR}/../lib/board-profiles.sh"
+
+usage() {
+  cat <<EOF
+Usage: ardconfig-discover [OPTIONS]
+
+Discover Arduino boards on the local network.
+
+Options:
+  --mac MAC         Additional MAC address to look for (can repeat)
+  --json            Output JSON instead of human-readable text
+  --quiet, -q       Suppress informational output
+  --help, -h        Show this help
+
+Exit codes:
+  0  Boards discovered
+  1  General failure
+  3  No boards discovered
+EOF
+}
+
+main() {
+  parse_args "$@"
+  if [[ "$ARG_HELP" == "true" ]]; then usage; exit 0; fi
+  load_config
+  output_init "$(get_output_format)" "$ARG_QUIET"
+
+  profiles_load 2>/dev/null || true
+
+  local results_json="[]"
+
+  # Step 1: mDNS
+  results_json=$(discover_mdns "$results_json")
+
+  # Step 2: Known MACs from config + --mac flag
+  results_json=$(discover_known_macs "$results_json")
+
+  # Step 3: ARP OUI scan
+  results_json=$(discover_arp_oui "$results_json")
+
+  # Step 4: nmap fallback
+  results_json=$(discover_nmap "$results_json")
+
+  # Deduplicate by MAC
+  results_json=$(echo "$results_json" | jq 'unique_by(.mac)')
+
+  local count
+  count=$(echo "$results_json" | jq 'length')
+
+  if [[ "$count" -eq 0 ]]; then
+    output_step error no_boards "No Arduino boards discovered on the network. Check: (1) Board is powered and connected to WiFi (2) Host is on the same network (3) known-macs.conf is configured for MAC-registered networks"
+    local extra
+    extra=$(jq -n --argjson b "$results_json" '{boards: $b}')
+    output_result "$EXIT_NO_HW" "$extra"
+    exit "$EXIT_NO_HW"
+  fi
+
+  for i in $(seq 0 $((count - 1))); do
+    local ip mac hostname method
+    ip=$(echo "$results_json" | jq -r ".[$i].ip")
+    mac=$(echo "$results_json" | jq -r ".[$i].mac")
+    hostname=$(echo "$results_json" | jq -r ".[$i].hostname // \"unknown\"")
+    method=$(echo "$results_json" | jq -r ".[$i].method")
+    output_step ok "net_board_${i}" "${hostname} at ${ip} [${mac}] (via ${method})"
+  done
+
+  local extra
+  extra=$(jq -n --argjson b "$results_json" '{boards: $b}')
+  output_result "$EXIT_OK" "$extra"
+  exit "$EXIT_OK"
+}
+
+discover_mdns() {
+  local results="$1"
+  if ! command -v avahi-browse &>/dev/null; then
+    output_step skip mdns "avahi-browse not available (run ardconfig-setup)"
+    echo "$results"
+    return
+  fi
+
+  output_step info mdns "Scanning mDNS for Arduino services..."
+  local mdns_out
+  mdns_out=$(avahi-browse -t -r -p _arduino._tcp 2>/dev/null || echo "")
+
+  if [[ -z "$mdns_out" ]]; then
+    output_step info mdns_result "No mDNS Arduino services found"
+    echo "$results"
+    return
+  fi
+
+  while IFS=';' read -r _ _ _ hostname _ ip _ _; do
+    [[ -z "$ip" ]] && continue
+    local mac
+    mac=$(ip neigh show "$ip" 2>/dev/null | awk '{print $5}' | head -1)
+    [[ -z "$mac" ]] && mac="unknown"
+    local entry
+    entry=$(jq -n --arg ip "$ip" --arg mac "$mac" --arg h "$hostname" \
+      '{ip: $ip, mac: $mac, hostname: $h, method: "mdns"}')
+    results=$(echo "$results" | jq --argjson e "$entry" '. + [$e]')
+  done <<< "$(echo "$mdns_out" | grep '^=' | grep -v '^=;')"
+
+  echo "$results"
+}
+
+discover_known_macs() {
+  local results="$1"
+  local macs_file="${ARDCONFIG_CONF}/known-macs.conf"
+  local search_macs=()
+
+  # From --mac flag
+  if [[ -n "$ARG_MAC" ]]; then
+    IFS=',' read -ra flag_macs <<< "$ARG_MAC"
+    search_macs+=("${flag_macs[@]}")
+  fi
+
+  # From config file
+  if [[ -f "$macs_file" ]]; then
+    while IFS=' ' read -r mac board_id label; do
+      [[ -z "$mac" || "$mac" == \#* ]] && continue
+      search_macs+=("$mac")
+    done < "$macs_file"
+  fi
+
+  if [[ ${#search_macs[@]} -eq 0 ]]; then
+    output_step skip known_macs "No known MACs configured"
+    echo "$results"
+    return
+  fi
+
+  local arp_table
+  arp_table=$(ip neigh show 2>/dev/null || echo "")
+
+  for mac in "${search_macs[@]}"; do
+    local mac_upper
+    mac_upper=$(echo "$mac" | tr '[:lower:]' '[:upper:]')
+    local match
+    match=$(echo "$arp_table" | grep -i "$mac_upper" | head -1 || echo "")
+    if [[ -n "$match" ]]; then
+      local ip
+      ip=$(echo "$match" | awk '{print $1}')
+      local hostname
+      hostname=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' || echo "unknown")
+      local entry
+      entry=$(jq -n --arg ip "$ip" --arg mac "$mac_upper" --arg h "$hostname" \
+        '{ip: $ip, mac: $mac, hostname: $h, method: "known_mac"}')
+      results=$(echo "$results" | jq --argjson e "$entry" '. + [$e]')
+    fi
+  done
+
+  echo "$results"
+}
+
+discover_arp_oui() {
+  local results="$1"
+  local oui_prefixes=()
+
+  # Collect OUI prefixes from all profiles
+  if [[ "$_PROFILES_LOADED" == "true" ]]; then
+    while IFS= read -r prefix; do
+      [[ -n "$prefix" ]] && oui_prefixes+=("$prefix")
+    done < <(echo "$_PROFILES_DATA" | jq -r '.[].mac_oui_prefixes[]? // empty' 2>/dev/null)
+  fi
+
+  if [[ ${#oui_prefixes[@]} -eq 0 ]]; then
+    output_step skip arp_oui "No OUI prefixes configured in board profiles"
+    echo "$results"
+    return
+  fi
+
+  local arp_table
+  arp_table=$(ip neigh show 2>/dev/null || echo "")
+
+  for prefix in "${oui_prefixes[@]}"; do
+    local prefix_upper
+    prefix_upper=$(echo "$prefix" | tr '[:lower:]' '[:upper:]')
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      local ip mac
+      ip=$(echo "$line" | awk '{print $1}')
+      mac=$(echo "$line" | awk '{print $5}')
+      local hostname
+      hostname=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' || echo "unknown")
+      local entry
+      entry=$(jq -n --arg ip "$ip" --arg mac "$mac" --arg h "$hostname" \
+        '{ip: $ip, mac: $mac, hostname: $h, method: "arp_oui"}')
+      results=$(echo "$results" | jq --argjson e "$entry" '. + [$e]')
+    done < <(echo "$arp_table" | grep -i "$prefix_upper" || echo "")
+  done
+
+  echo "$results"
+}
+
+discover_nmap() {
+  local results="$1"
+  if ! command -v nmap &>/dev/null; then
+    output_step skip nmap "nmap not available (run ardconfig-setup)"
+    echo "$results"
+    return
+  fi
+
+  # Get local subnet
+  local subnet
+  subnet=$(ip route show default 2>/dev/null | awk '{print $3}' | head -1)
+  if [[ -z "$subnet" ]]; then
+    output_step skip nmap "Could not determine local subnet"
+    echo "$results"
+    return
+  fi
+  local cidr
+  cidr=$(ip route show 2>/dev/null | grep -v default | grep "src" | head -1 | awk '{print $1}')
+  if [[ -z "$cidr" ]]; then
+    output_step skip nmap "Could not determine subnet CIDR"
+    echo "$results"
+    return
+  fi
+
+  output_step info nmap "Scanning ${cidr} with nmap..."
+  local nmap_out
+  nmap_out=$(nmap -sn "$cidr" 2>/dev/null || echo "")
+
+  # Look for Arduino in MAC vendor strings
+  local in_host="" current_ip=""
+  while IFS= read -r line; do
+    if echo "$line" | grep -q "Nmap scan report for"; then
+      current_ip=$(echo "$line" | grep -oP '\d+\.\d+\.\d+\.\d+')
+    fi
+    if echo "$line" | grep -qi "arduino\|qualcomm"; then
+      local mac
+      mac=$(echo "$line" | grep -oP '([0-9A-F]{2}:){5}[0-9A-F]{2}' || echo "unknown")
+      local hostname
+      hostname=$(getent hosts "$current_ip" 2>/dev/null | awk '{print $2}' || echo "unknown")
+      local entry
+      entry=$(jq -n --arg ip "$current_ip" --arg mac "$mac" --arg h "$hostname" \
+        '{ip: $ip, mac: $mac, hostname: $h, method: "nmap"}')
+      results=$(echo "$results" | jq --argjson e "$entry" '. + [$e]')
+    fi
+  done <<< "$nmap_out"
+
+  echo "$results"
+}
+
+main "$@"
