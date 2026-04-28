@@ -1,0 +1,333 @@
+#!/usr/bin/env bash
+# ardconfig-onboard — AI-powered board onboarding
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+source "${SCRIPT_DIR}/../lib/common.sh"
+source "${SCRIPT_DIR}/../lib/output.sh"
+
+# Custom args for onboard
+_ONBOARD_VENDOR_ID=""
+_ONBOARD_PRODUCT_ID=""
+_ONBOARD_BOARD_NAME=""
+
+usage() {
+  cat <<EOF
+Usage: ardconfig-onboard [OPTIONS]
+
+Onboard a new Arduino-compatible board using AI-assisted research.
+
+Options:
+  --vendor-id VID     USB vendor ID (hex, e.g., 0483)
+  --product-id PID    USB product ID (hex, e.g., 374b)
+  --board-name NAME   Board name for research (e.g., "Nucleo-F411RE")
+  --json              Output JSON instead of human-readable text
+  --quiet, -q         Suppress informational output
+  --non-interactive   Run without prompts (auto-approve confirmation)
+  --help, -h          Show this help
+
+Exit codes:
+  0  Board onboarded successfully
+  1  Onboarding failed
+  2  Missing prerequisites (no AWS creds, no Python, no venv)
+  3  No unknown hardware found (hardware-present mode)
+  4  Partial success (profile created but setup/verify failed)
+EOF
+}
+
+# Parse custom args before passing remainder to parse_args
+parse_onboard_args() {
+  local passthrough=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --vendor-id)   shift; _ONBOARD_VENDOR_ID="$1" ;;
+      --vendor-id=*) _ONBOARD_VENDOR_ID="${1#*=}" ;;
+      --product-id)  shift; _ONBOARD_PRODUCT_ID="$1" ;;
+      --product-id=*) _ONBOARD_PRODUCT_ID="${1#*=}" ;;
+      --board-name)  shift; _ONBOARD_BOARD_NAME="$1" ;;
+      --board-name=*) _ONBOARD_BOARD_NAME="${1#*=}" ;;
+      *)             passthrough+=("$1") ;;
+    esac
+    shift
+  done
+  parse_args "${passthrough[@]+"${passthrough[@]}"}"
+}
+
+ensure_ai_deps() {
+  local venv="${ARDCONFIG_VENV_PATH:-.venv}"
+  if [[ ! -f "${venv}/bin/python" ]]; then
+    output_step error venv "Python venv not found at ${venv}. Run ardconfig-setup first."
+    output_result "$EXIT_PREREQ"
+    exit "$EXIT_PREREQ"
+  fi
+  local missing=()
+  "${venv}/bin/python" -c "import strands" 2>/dev/null || missing+=(strands-agents)
+  "${venv}/bin/python" -c "import boto3" 2>/dev/null || missing+=(boto3)
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    output_step info deps "Installing AI dependencies: ${missing[*]}"
+    if ! "${venv}/bin/pip" install --quiet "${missing[@]}"; then
+      output_step error deps "Failed to install: ${missing[*]}"
+      output_result "$EXIT_PREREQ"
+      exit "$EXIT_PREREQ"
+    fi
+    output_step ok deps "AI dependencies installed"
+  fi
+}
+
+check_aws_credentials() {
+  local venv="${ARDCONFIG_VENV_PATH:-.venv}"
+  local region="${ARDCONFIG_AWS_REGION:-${AWS_DEFAULT_REGION:-us-west-2}}"
+  if ! "${venv}/bin/python" -c "import boto3; boto3.client('sts', region_name='${region}').get_caller_identity()" 2>/dev/null; then
+    output_step error aws_creds "AWS credentials not configured or invalid. Configure credentials (aws configure / environment variables) and ensure Bedrock access."
+    output_result "$EXIT_PREREQ"
+    exit "$EXIT_PREREQ"
+  fi
+  output_step ok aws_creds "AWS credentials verified"
+}
+
+scan_unknown_devices() {
+  # Load profiles for matching
+  local has_profiles=false
+  if command -v jq &>/dev/null; then
+    source "${SCRIPT_DIR}/../lib/board-profiles.sh"
+    if profiles_load 2>/dev/null; then
+      has_profiles=true
+    fi
+  fi
+
+  local unknown=()
+  for dev in /dev/ttyACM* /dev/ttyUSB*; do
+    [[ -e "$dev" ]] || continue
+    local info
+    info=$(udevadm info --name="$dev" 2>/dev/null || echo "")
+    [[ -z "$info" ]] && continue
+
+    local vid pid model
+    vid=$(echo "$info" | grep -oP 'ID_VENDOR_ID=\K.*' || echo "")
+    [[ -n "$vid" ]] || continue
+    pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+    model=$(echo "$info" | grep -oP 'ID_MODEL=\K.*' || echo "")
+
+    local is_known=false
+    if [[ "$has_profiles" == "true" && -n "$pid" ]]; then
+      local match
+      match=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+      [[ -n "$match" ]] && is_known=true
+    fi
+
+    if [[ "$is_known" == "false" ]]; then
+      unknown+=("${dev}|${vid}|${pid}|${model}")
+    fi
+  done
+
+  if [[ ${#unknown[@]} -eq 0 ]]; then
+    output_step error no_unknown "No unknown USB devices found. All connected devices already have profiles."
+    output_result "$EXIT_NO_HW"
+    exit "$EXIT_NO_HW"
+  fi
+
+  local selected="${unknown[0]}"
+  if [[ ${#unknown[@]} -gt 1 ]]; then
+    if [[ "$ARG_NON_INTERACTIVE" == "true" ]]; then
+      output_step info select "Multiple unknown devices found, using first in non-interactive mode"
+    else
+      echo ""
+      echo "Multiple unknown USB devices found:"
+      local i=1
+      for entry in "${unknown[@]}"; do
+        IFS='|' read -r d v p m <<< "$entry"
+        echo "  ${i}) ${m:-Unknown} on ${d} [vendor=${v} product=${p}]"
+        ((i++))
+      done
+      echo ""
+      read -rp "Select device [1]: " choice
+      choice="${choice:-1}"
+      if [[ "$choice" -ge 1 && "$choice" -le ${#unknown[@]} ]] 2>/dev/null; then
+        selected="${unknown[$((choice - 1))]}"
+      fi
+    fi
+  fi
+
+  IFS='|' read -r _SCAN_DEV _ONBOARD_VENDOR_ID _ONBOARD_PRODUCT_ID _SCAN_MODEL <<< "$selected"
+  output_step info device "Selected: ${_SCAN_MODEL:-Unknown} on ${_SCAN_DEV} [vendor=${_ONBOARD_VENDOR_ID} product=${_ONBOARD_PRODUCT_ID}]"
+}
+
+invoke_agent() {
+  local venv="${ARDCONFIG_VENV_PATH:-.venv}"
+  local agent_input
+  agent_input=$(jq -n \
+    --arg vid "$_ONBOARD_VENDOR_ID" \
+    --arg pid "$_ONBOARD_PRODUCT_ID" \
+    --arg name "$_ONBOARD_BOARD_NAME" \
+    --arg model "${_SCAN_MODEL:-}" \
+    '{vendor_id: $vid, product_id: $pid, board_name: $name, usb_model: $model}')
+
+  output_step info agent "Invoking AI agent to research board..."
+
+  local agent_output
+  agent_output=$(echo "$agent_input" | \
+    PYTHONPATH="$ARDCONFIG_ROOT" \
+    ARDCONFIG_BEDROCK_MODEL="${ARDCONFIG_BEDROCK_MODEL:-}" \
+    ARDCONFIG_AWS_REGION="${ARDCONFIG_AWS_REGION:-}" \
+    "${venv}/bin/python" -m agent.onboard_agent 2>/dev/null) || {
+    output_step error agent "AI agent failed to execute"
+    output_result "$EXIT_FAIL"
+    exit "$EXIT_FAIL"
+  }
+
+  echo "$agent_output"
+}
+
+handle_success() {
+  local agent_output="$1"
+  local profile
+  profile=$(echo "$agent_output" | jq '.profile')
+  local proposed_id
+  proposed_id=$(echo "$profile" | jq -r '.id')
+
+  # Display profile
+  output_step ok agent "AI agent generated profile:"
+  if [[ "$_OUTPUT_FORMAT" == "human" && "$_OUTPUT_QUIET" != "true" ]]; then
+    echo ""
+    echo "$profile" | jq .
+    echo ""
+  fi
+
+  local profile_id="$proposed_id"
+
+  # Interactive: allow ID override and confirm
+  if [[ "$ARG_NON_INTERACTIVE" != "true" ]]; then
+    read -rp "Profile ID [${proposed_id}]: " id_override
+    if [[ -n "$id_override" ]]; then
+      profile_id="$id_override"
+      profile=$(echo "$profile" | jq --arg id "$profile_id" '.id = $id')
+    fi
+
+    # Check for conflict
+    if [[ -f "${ARDCONFIG_PROFILES}/${profile_id}.json" ]]; then
+      output_step warn conflict "Profile '${profile_id}' already exists."
+      read -rp "Overwrite? [y/n]: " overwrite
+      if [[ "$overwrite" != "y" && "$overwrite" != "Y" ]]; then
+        read -rp "Enter new ID: " profile_id
+        profile=$(echo "$profile" | jq --arg id "$profile_id" '.id = $id')
+      fi
+    fi
+
+    read -rp "Write this profile? [y/n]: " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+      output_step info cancelled "Profile not written."
+      output_result "$EXIT_OK"
+      exit "$EXIT_OK"
+    fi
+  else
+    # Non-interactive: check conflict and fail if exists
+    if [[ -f "${ARDCONFIG_PROFILES}/${profile_id}.json" ]]; then
+      output_step warn conflict "Profile '${profile_id}' already exists, overwriting in non-interactive mode."
+    fi
+  fi
+
+  # Write profile
+  echo "$profile" | jq . > "${ARDCONFIG_PROFILES}/${profile_id}.json"
+  output_step ok write "Profile written to profiles/${profile_id}.json"
+
+  # Update udev rules if needed
+  local vid
+  vid=$(echo "$profile" | jq -r '.usb_vendor_id')
+  if [[ -n "$vid" && "$vid" != "null" ]]; then
+    update_udev_rules "$vid"
+  fi
+
+  local extra
+  extra=$(jq -n --argjson p "$profile" '{profile: $p}')
+  output_result "$EXIT_OK" "$extra"
+  exit "$EXIT_OK"
+}
+
+handle_partial() {
+  local agent_output="$1"
+  local raw
+  raw=$(echo "$agent_output" | jq -r '.raw // .error // "Unknown"')
+
+  output_step warn agent "AI agent returned partial results."
+  if [[ "$_OUTPUT_FORMAT" == "human" && "$_OUTPUT_QUIET" != "true" ]]; then
+    echo ""
+    echo "$raw"
+    echo ""
+    echo "Some fields could not be determined. Ask Kiro to help complete the profile."
+  fi
+
+  output_result "$EXIT_PARTIAL" "$agent_output"
+  exit "$EXIT_PARTIAL"
+}
+
+handle_failure() {
+  local agent_output="$1"
+  local error
+  error=$(echo "$agent_output" | jq -r '.error // "Unknown error"')
+
+  output_step error agent "Onboarding failed: ${error}"
+  output_result "$EXIT_FAIL"
+  exit "$EXIT_FAIL"
+}
+
+update_udev_rules() {
+  local vendor_id="$1"
+  local rules_src="${ARDCONFIG_UDEV}/99-arduino.rules"
+  if grep -q "idVendor==\"${vendor_id}\"" "$rules_src" 2>/dev/null; then
+    return 0
+  fi
+  echo "" >> "$rules_src"
+  echo "# Vendor ${vendor_id} (added by ardconfig-onboard)" >> "$rules_src"
+  echo "SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"${vendor_id}\", MODE=\"0666\"" >> "$rules_src"
+  echo "SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"${vendor_id}\", MODE=\"0666\"" >> "$rules_src"
+  output_step info udev "Added udev rule for vendor ${vendor_id}"
+  require_sudo
+  run_sudo cp "$rules_src" /etc/udev/rules.d/99-arduino.rules
+  run_sudo udevadm control --reload-rules
+  run_sudo udevadm trigger
+  output_step ok udev "Udev rules reloaded"
+}
+
+main() {
+  # Globals for scan results
+  _SCAN_DEV=""
+  _SCAN_MODEL=""
+
+  parse_onboard_args "$@"
+  if [[ "$ARG_HELP" == "true" ]]; then usage; exit 0; fi
+  load_config
+  output_init "$(get_output_format)" "$ARG_QUIET"
+
+  # JIT deps
+  ensure_ai_deps
+
+  # AWS credential check
+  check_aws_credentials
+
+  # Determine input
+  if [[ -z "$_ONBOARD_VENDOR_ID" && -z "$_ONBOARD_PRODUCT_ID" && -z "$_ONBOARD_BOARD_NAME" ]]; then
+    scan_unknown_devices
+  fi
+
+  if [[ -z "$_ONBOARD_VENDOR_ID" && -z "$_ONBOARD_PRODUCT_ID" && -z "$_ONBOARD_BOARD_NAME" ]]; then
+    output_step error input "No board input could be determined. Provide --vendor-id/--product-id or --board-name."
+    output_result "$EXIT_NO_HW"
+    exit "$EXIT_NO_HW"
+  fi
+
+  # Invoke agent
+  local agent_output
+  agent_output=$(invoke_agent)
+
+  # Parse status and dispatch
+  local status
+  status=$(echo "$agent_output" | jq -r '.status // "failure"')
+
+  case "$status" in
+    success) handle_success "$agent_output" ;;
+    partial) handle_partial "$agent_output" ;;
+    *)       handle_failure "$agent_output" ;;
+  esac
+}
+
+main "$@"

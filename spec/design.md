@@ -1,326 +1,548 @@
-# Design — ardconfig
+# Design — AI-Powered Hardware Onboarding for ardconfig
 
 ## 1. Architecture Overview
 
-ardconfig is a collection of bash scripts organized around a **board profile** abstraction. Each supported board is described by a JSON profile file. Scripts read these profiles to determine FQBNs, core packages, USB identifiers, and discovery methods — so adding or updating board support requires no script changes.
+The onboarding feature adds a single new entry point (`bin/ardconfig-onboard`) and a Python agent package (`agent/`). It modifies one existing script (`bin/ardconfig-detect`) and one config file (`conf/ardconfig.conf`). No existing libraries or profile schema are changed.
 
 ```
-ardconfig/
-├── bin/                        # Executable scripts (user-facing)
-│   ├── ardconfig-setup         # FR-1, FR-2, FR-3, FR-5.1
-│   ├── ardconfig-detect        # FR-4
-│   ├── ardconfig-discover      # FR-5
-│   ├── ardconfig-verify        # FR-6
-│   └── ardconfig-health        # FR-7
-├── lib/                        # Shared libraries (sourced by scripts)
-│   ├── output.sh               # NFR-5: JSON-canonical output, human formatting
-│   ├── common.sh               # Arg parsing, exit codes, sudo helpers
-│   └── board-profiles.sh       # Board profile loader
-├── profiles/                   # Board profile JSON files
-│   ├── uno-q.json
-│   ├── r4wifi.json
-│   └── giga.json
-├── templates/                  # Test sketch templates
-│   └── blink.ino
-├── conf/                       # User-editable configuration
-│   ├── ardconfig.conf          # Defaults (venv path, board selection)
-│   └── known-macs.conf         # MAC addresses for network discovery (FR-5.3)
-├── udev/                       # udev rule templates
-│   └── 99-arduino.rules
-└── README.md                   # NFR-6
+┌─────────────────────────────────────────────────────────────────┐
+│                        User / AI Agent                          │
+│                     ardconfig-onboard [args]                    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │
+                ┌──────────▼──────────┐
+                │  bin/ardconfig-     │  Bash wrapper
+                │  onboard            │  - arg parsing, config
+                │                     │  - JIT dep install
+                │                     │  - scan for unknown USB
+                │                     │  - invoke Python agent
+                │                     │  - human confirmation
+                │                     │  - udev rule update
+                └──────────┬──────────┘
+                           │ subprocess (Python)
+                ┌──────────▼──────────┐
+                │  agent/             │  Strands AI agent
+                │  onboard_agent.py   │  - research board
+                │  tools.py           │  - generate profile JSON
+                │                     │  - validate via bash
+                │                     │  - run setup & verify
+                │                     │  - iterate on failure
+                └──────────┬──────────┘
+                           │ tools call
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+   arduino-cli        web search     existing scripts
+   board listall      (board docs)   ardconfig-setup
+   core search                       ardconfig-verify
+   core install                      board-profiles.sh
 ```
 
-## 2. Board Profile Schema
+### Modified Existing Components
 
-Each profile in `profiles/` is a JSON file:
+| Component | Change | Requirement |
+|---|---|---|
+| `bin/ardconfig-detect` | Remove `vid == "2341"` guard; match all profile vendor IDs; report unknown devices | FR-1, FR-2 |
+| `conf/ardconfig.conf` | Add `ARDCONFIG_BEDROCK_MODEL` and `ARDCONFIG_AWS_REGION` | FR-11, FR-12 |
+| `udev/99-arduino.rules` | Appended at runtime by onboard script for new vendor IDs | FR-18 |
 
-```json
-{
-  "id": "uno-q",
-  "name": "Arduino Uno Q",
-  "fqbn": "arduino:zephyr:unoq",
-  "core": "arduino:zephyr",
-  "core_url": "https://downloads.arduino.cc/packages/package_zephyr_index.json",
-  "usb_vendor_id": "2341",
-  "usb_product_id": "0078",
-  "usb_driver": "cdc_acm",
-  "serial_pattern": "/dev/ttyACM*",
-  "network_discoverable": true,
-  "mac_oui_prefixes": [],
-  "blink_led_pin": 50,
-  "notes": "Zephyr core is BETA. Requires bootloader burn on first use."
+### New Components
+
+| Component | Purpose | Requirement |
+|---|---|---|
+| `bin/ardconfig-onboard` | Bash entry point for onboarding flow | FR-3 |
+| `agent/__init__.py` | Package marker | — |
+| `agent/onboard_agent.py` | Strands AI agent: research, generate, validate, setup, verify | FR-7 through FR-10, FR-13, FR-19–21 |
+| `agent/tools.py` | Tool definitions for the Strands agent | FR-8, FR-9, FR-10 |
+
+---
+
+## 2. Component Design: bin/ardconfig-onboard
+
+Bash wrapper script. Follows the same patterns as all existing ardconfig scripts.
+
+### Responsibilities
+
+1. Parse args (`--vendor-id`, `--product-id`, `--board-name`, `--json`, `--quiet`, `--non-interactive`, `--help`)
+2. Load config (`load_config` from common.sh)
+3. JIT install AI dependencies if missing (FR-22)
+4. Determine onboarding input:
+   - If `--vendor-id`/`--product-id` or `--board-name` provided: use those (headless mode)
+   - Otherwise: scan USB for unknown devices (hardware-present mode)
+5. Check for existing profile conflict (FR-17)
+6. Invoke the Python agent via subprocess, passing input as JSON on stdin
+7. Receive agent output (profile JSON + status) on stdout
+8. Display profile to user, prompt for confirmation (FR-16) — skip in `--non-interactive`
+9. Allow user to override profile `id` (FR-14)
+10. Write profile to `profiles/<id>.json`
+11. Update udev rules if new vendor ID (FR-18)
+12. The agent handles setup and verify internally (FR-19, FR-20)
+13. Emit final result via output.sh
+
+### CLI Interface
+
+```
+Usage: ardconfig-onboard [OPTIONS]
+
+Onboard a new Arduino-compatible board using AI-assisted research.
+
+Options:
+  --vendor-id VID     USB vendor ID (hex, e.g., 0483)
+  --product-id PID    USB product ID (hex, e.g., 374b)
+  --board-name NAME   Board name for research (e.g., "Nucleo-F411RE")
+  --json              Output JSON instead of human-readable text
+  --quiet, -q         Suppress informational output
+  --non-interactive   Run without prompts (auto-approve confirmation)
+  --help, -h          Show this help
+
+Exit codes:
+  0  Board onboarded successfully
+  1  Onboarding failed
+  2  Missing prerequisites (no AWS creds, no Python, no venv)
+  3  No unknown hardware found (hardware-present mode)
+  4  Partial success (profile created but setup/verify failed)
+```
+
+### Unknown Device Scanning
+
+When no `--vendor-id`/`--product-id`/`--board-name` flags are provided, the script scans `/dev/ttyACM*` and `/dev/ttyUSB*` using `udevadm info`, loads all profiles via `board-profiles.sh`, and identifies devices whose vendor/product ID does not match any profile (via `profiles_match_usb`). If multiple unknown devices are found, presents a selection menu (or processes the first one in `--non-interactive` mode).
+
+### JIT Dependency Install (FR-22)
+
+```bash
+ensure_ai_deps() {
+  local venv="${ARDCONFIG_VENV_PATH:-.venv}"
+  if [[ ! -f "${venv}/bin/python" ]]; then
+    output_step error venv "Python venv not found. Run ardconfig-setup first."
+    exit "$EXIT_PREREQ"
+  fi
+  local missing=()
+  "${venv}/bin/python" -c "import strands" 2>/dev/null || missing+=(strands-agents)
+  "${venv}/bin/python" -c "import boto3" 2>/dev/null || missing+=(boto3)
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    output_step info deps "Installing AI dependencies: ${missing[*]}"
+    "${venv}/bin/pip" install --quiet "${missing[@]}" || {
+      output_step error deps "Failed to install: ${missing[*]}"
+      exit "$EXIT_PREREQ"
+    }
+    output_step ok deps "AI dependencies installed"
+  fi
 }
 ```
 
-Fields:
-- `id` — Short identifier used in `--boards` flag
-- `fqbn` — Fully Qualified Board Name for arduino-cli
-- `core` — arduino-cli core package name
-- `core_url` — Additional board manager URL (empty string if not needed)
-- `usb_vendor_id` / `usb_product_id` — USB device identification
-- `serial_pattern` — Glob for expected serial device paths
-- `network_discoverable` — Whether to include in network discovery
-- `mac_oui_prefixes` — Known MAC OUI prefixes for ARP/nmap fallback (empty if unknown; populate via `known-macs.conf` or discover at runtime)
-- `blink_led_pin` — LED pin for the Blink test sketch. If set to `"LED_BUILTIN"` (string) or omitted, the template uses the core's built-in `LED_BUILTIN` constant. Numeric values override for boards where `LED_BUILTIN` is incorrect (e.g., Uno Q uses pin 50).
+### Udev Rule Update (FR-18)
 
-### Adding a new board
-
-Create a new JSON file in `profiles/`. No script changes needed. The `board-profiles.sh` library auto-discovers all `*.json` files in the profiles directory.
-
-### Note on the Giga Display Shield
-
-The `giga` profile represents the **Arduino Giga R1 WiFi** board, which the Giga Display Shield (ASX00039) attaches to. The display shield is a peripheral — it doesn't need its own profile. The README should clarify that users need the Giga R1 WiFi board to use the display shield.
-
-## 3. Component Design
-
-### 3.1 Shared Output Library (`lib/output.sh`)
-
-Implements NFR-5. All output goes through this library.
-
-**Internal model:** Scripts build a result object as a bash associative array / JSON string. At script exit, the library emits either raw JSON or human-readable text derived from it.
-
-Key functions:
-- `output_init` — Initialize output state, parse `--json` / `--quiet` flags
-- `output_step STATUS MESSAGE [DETAIL]` — Record a step result (STATUS: ok/skip/warn/error/info)
-- `output_result` — Emit final output (JSON or human-readable)
-- `output_json_raw KEY VALUE` — Append raw key-value to the JSON result
-
-Human-readable format derives from JSON:
-```
-[OK]   dialout group membership
-[SKIP] udev rules (already installed)
-[WARN] logout required for group membership
-[ERROR] arduino-cli core install failed: arduino:zephyr
+```bash
+update_udev_rules() {
+  local vendor_id="$1"
+  local rules_src="${ARDCONFIG_UDEV}/99-arduino.rules"
+  if grep -q "idVendor==\"${vendor_id}\"" "$rules_src" 2>/dev/null; then
+    return 0  # Already covered
+  fi
+  local comment="# Vendor ${vendor_id} (added by ardconfig-onboard)"
+  local rule="SUBSYSTEM==\"tty\", ATTRS{idVendor}==\"${vendor_id}\", MODE=\"0666\""
+  local rule2="SUBSYSTEM==\"usb\", ATTRS{idVendor}==\"${vendor_id}\", MODE=\"0666\""
+  echo "" >> "$rules_src"
+  echo "$comment" >> "$rules_src"
+  echo "$rule" >> "$rules_src"
+  echo "$rule2" >> "$rules_src"
+  require_sudo
+  run_sudo cp "$rules_src" /etc/udev/rules.d/99-arduino.rules
+  run_sudo udevadm control --reload-rules
+  run_sudo udevadm trigger
+}
 ```
 
-JSON format:
+---
+
+## 3. Component Design: Python Strands AI Agent
+
+### File Structure
+
+```
+agent/
+├── __init__.py
+├── onboard_agent.py    # Agent definition, system prompt, main entry point
+└── tools.py            # Strands tool definitions
+```
+
+### Agent System Prompt
+
+```
+You are an Arduino board identification agent. Given a USB device's vendor ID
+and product ID (and optionally a board name), your job is to research the board
+and produce a complete ardconfig board profile JSON.
+
+The profile must contain these fields:
+- id: short identifier (lowercase, hyphenated, e.g., "nucleo-f411re")
+- name: human-readable name (e.g., "STM32 Nucleo-F411RE")
+- fqbn: Fully Qualified Board Name for arduino-cli
+- core: arduino-cli core package identifier
+- core_url: board manager URL (empty string if official Arduino core)
+- usb_vendor_id: 4-digit hex USB vendor ID
+- usb_product_id: 4-digit hex USB product ID
+- usb_driver: Linux kernel driver (typically "cdc_acm" or "ch341-uart")
+- serial_pattern: glob for serial device (typically "/dev/ttyACM*" or "/dev/ttyUSB*")
+- network_discoverable: boolean
+- mac_oui_prefixes: array of MAC prefixes (usually empty)
+- blink_led_pin: "LED_BUILTIN" or a pin number
+- notes: brief description of the board
+
+Workflow:
+1. Use arduino_cli_search to find matching boards and cores
+2. Use web_search to find board documentation, pinouts, and board manager URLs
+3. Read existing profiles with read_file for schema reference
+4. Generate the profile JSON
+5. Validate it with validate_profile
+6. Run setup with run_setup to install the core
+7. Run verify with run_verify to compile a test sketch
+8. If setup or verify fails, analyze the error and retry with corrected values (max 2 retries)
+
+Output the final profile JSON as your last message, wrapped in ```json fences.
+If you cannot determine all fields, set unknown fields to "TODO" and explain what's missing.
+```
+
+### Tool Definitions (agent/tools.py)
+
+Each tool is a Python function decorated with `@tool` from the Strands AI SDK.
+
+**arduino_cli_search(command: str) → str**
+Runs an arduino-cli command and returns stdout. Allowed commands:
+- `board listall` — list all known boards and FQBNs
+- `board listall <search>` — search for a specific board
+- `core search <query>` — search for core packages
+- `core list` — list installed cores
+- `config dump` — show current config including board manager URLs
+
+Implementation: `subprocess.run(["arduino-cli"] + command.split(), capture_output=True, text=True)`
+
+**web_search(query: str) → str**
+Searches the web for board documentation. Implementation: uses a simple HTTP search API or the Strands built-in web search tool if available. Returns top results as text.
+
+**read_file(path: str) → str**
+Reads a file and returns its contents. Restricted to the ardconfig project directory for security.
+
+**write_file(path: str, content: str) → str**
+Writes content to a file. Restricted to `profiles/` directory.
+
+**validate_profile(profile_path: str) → str**
+Validates a profile JSON by invoking the bash validation:
+```python
+result = subprocess.run(
+    ["bash", "-c", f"""
+        source lib/board-profiles.sh
+        jq -e '.id and .fqbn and .core and .usb_vendor_id and .usb_product_id' {profile_path}
+    """],
+    capture_output=True, text=True, cwd=ARDCONFIG_ROOT
+)
+```
+Returns "valid" or the validation error.
+
+**run_setup(board_id: str) → str**
+Runs `bin/ardconfig-setup --boards <board_id> --non-interactive --json` and returns the JSON output.
+
+**run_verify(board_id: str) → str**
+Runs `bin/ardconfig-verify --boards <board_id> --json` and returns the JSON output.
+
+### Agent Entry Point (agent/onboard_agent.py)
+
+```python
+"""ardconfig AI-powered board onboarding agent."""
+import json
+import sys
+import os
+
+from strands import Agent
+from strands.models.bedrock import BedrockModel
+from agent.tools import (
+    arduino_cli_search, web_search, read_file,
+    write_file, validate_profile, run_setup, run_verify
+)
+
+SYSTEM_PROMPT = """..."""  # As defined above
+
+def create_agent():
+    model_id = os.environ.get(
+        "ARDCONFIG_BEDROCK_MODEL", "us.anthropic.claude-sonnet-4-6"
+    )
+    region = os.environ.get("ARDCONFIG_AWS_REGION",
+             os.environ.get("AWS_DEFAULT_REGION", "us-west-2"))
+
+    model = BedrockModel(
+        model_id=model_id,
+        region_name=region
+    )
+    return Agent(
+        model=model,
+        system_prompt=SYSTEM_PROMPT,
+        tools=[
+            arduino_cli_search, web_search, read_file,
+            write_file, validate_profile, run_setup, run_verify
+        ]
+    )
+
+def main():
+    """Entry point called by bin/ardconfig-onboard.
+
+    Reads JSON input from stdin:
+      {"vendor_id": "0483", "product_id": "374b", "board_name": "Nucleo-F411RE"}
+
+    Writes JSON output to stdout:
+      {"status": "success", "profile": {...}, "setup_result": {...}, "verify_result": {...}}
+    """
+    input_data = json.loads(sys.stdin.read())
+    agent = create_agent()
+
+    prompt = build_prompt(input_data)
+    result = agent(prompt)
+
+    # Parse the profile JSON from the agent's response
+    output = parse_agent_output(result)
+    json.dump(output, sys.stdout, indent=2)
+
+def build_prompt(input_data):
+    parts = ["Research and create a board profile for an Arduino-compatible board."]
+    if input_data.get("vendor_id") and input_data.get("product_id"):
+        parts.append(f"USB Vendor ID: {input_data['vendor_id']}")
+        parts.append(f"USB Product ID: {input_data['product_id']}")
+    if input_data.get("board_name"):
+        parts.append(f"Board name: {input_data['board_name']}")
+    parts.append("Read an existing profile from profiles/ to understand the schema.")
+    parts.append("Then research this board and generate a complete profile.")
+    return "\n".join(parts)
+
+def parse_agent_output(result):
+    # Extract JSON from the agent's response text
+    text = str(result)
+    # Look for ```json ... ``` block
+    import re
+    match = re.search(r'```json\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if match:
+        profile = json.loads(match.group(1))
+        return {"status": "success", "profile": profile}
+    return {"status": "failure", "error": "Could not parse profile from agent response", "raw": text}
+
+if __name__ == "__main__":
+    main()
+```
+
+### Interface Contract: Bash ↔ Python
+
+**Input** (stdin to Python, JSON):
 ```json
 {
-  "status": "partial",
-  "exit_code": 4,
-  "steps": [
-    {"name": "dialout_group", "status": "ok", "message": "Added user to dialout"},
-    {"name": "udev_rules", "status": "skip", "message": "Already installed"},
-    {"name": "core_install_zephyr", "status": "error", "message": "Install failed", "detail": "..."}
+  "vendor_id": "0483",
+  "product_id": "374b",
+  "board_name": "Nucleo-F411RE"
+}
+```
+All fields optional. At least one of `vendor_id`+`product_id` or `board_name` must be present.
+
+**Output** (stdout from Python, JSON):
+```json
+{
+  "status": "success|failure|partial",
+  "profile": { /* complete profile JSON */ },
+  "setup_result": { "exit_code": 0, "output": "..." },
+  "verify_result": { "exit_code": 0, "output": "..." },
+  "error": "...",
+  "retries": 1
+}
+```
+
+The bash wrapper reads this, handles confirmation, writes the profile file, and updates udev rules.
+
+---
+
+## 4. Modification: ardconfig-detect (FR-1, FR-2)
+
+### Current Behavior (lines 35-43)
+
+```bash
+if [[ "$vid" == "2341" ]]; then
+  is_arduino=true
+elif [[ "$_HAS_PROFILES" == "true" && -n "$vid" ]]; then
+  pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+  local alt_match
+  alt_match=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+  [[ -n "$alt_match" ]] && is_arduino=true
+fi
+[[ "$is_arduino" == "true" ]] || continue
+```
+
+### New Behavior
+
+```bash
+pid=$(echo "$info" | grep -oP 'ID_MODEL_ID=\K.*' || echo "")
+
+local is_known=false
+if [[ "$_HAS_PROFILES" == "true" && -n "$vid" && -n "$pid" ]]; then
+  local match
+  match=$(profiles_match_usb "$vid" "$pid" 2>/dev/null || echo "")
+  [[ -n "$match" ]] && is_known=true
+fi
+
+if [[ "$is_known" == "true" ]]; then
+  # Existing behavior: enrich from profile, report as known board
+  found=true
+  # ... (existing enrichment code unchanged)
+elif [[ -n "$vid" ]]; then
+  # NEW: Report as unknown device (FR-1)
+  found_unknown=true
+  local board_entry
+  board_entry=$(jq -n \
+    --arg dev "$dev" --arg vid "$vid" --arg pid "$pid" \
+    --arg model "$model" --arg serial "$serial" \
+    '{device: $dev, vendor_id: $vid, product_id: $pid, name: $model, board_id: "", fqbn: "", status: "unknown"}')
+  unknown_json=$(echo "$unknown_json" | jq --argjson b "$board_entry" '. + [$b]')
+  output_step info "unknown_${dev##*/}" "Unknown device on ${dev} [vendor=${vid} product=${pid}] — run ardconfig-onboard"
+fi
+```
+
+The JSON output gains an `unknown_boards` array alongside the existing `boards` array:
+```json
+{
+  "status": "success",
+  "boards": [...],
+  "unknown_boards": [
+    {"device": "/dev/ttyACM0", "vendor_id": "0483", "product_id": "374b", "name": "ST-Link", "status": "unknown"}
   ]
 }
 ```
 
-### 3.2 Common Library (`lib/common.sh`)
+### Backward Compatibility (NFR-6)
 
-Shared utilities:
-- `parse_args "$@"` — Standard flag parsing (`--json`, `--quiet`, `--non-interactive`, `--boards`, `--help`)
-- `require_command CMD` — Check if a command exists, exit 2 if not
-- `require_sudo` — Check sudo availability; in non-interactive mode, exit 2 if unavailable
-- `run_sudo CMD...` — Run a command with sudo, respecting non-interactive mode
-- Exit code constants: `EXIT_OK=0`, `EXIT_FAIL=1`, `EXIT_PREREQ=2`, `EXIT_NO_HW=3`, `EXIT_PARTIAL=4`
+- Boards with vendor `2341` are now matched via `profiles_match_usb()` instead of a hardcoded check. Since all 3 Arduino-vendor profiles (uno-q, r4wifi, giga) have `usb_vendor_id: "2341"`, they match identically.
+- The nano profile (vendor `2341` primary, alt chips `1a86`/`0403`) also matches identically since `profiles_match_usb` checks primary first, then alt chips.
+- The only behavioral change: devices with unknown vendor IDs now appear in output as `unknown` instead of being silently skipped.
 
-### 3.3 Board Profiles Library (`lib/board-profiles.sh`)
+---
 
-- `profiles_load` — Read all `profiles/*.json` files into memory
-- `profiles_list` — List all available board IDs
-- `profiles_get BOARD_ID FIELD` — Get a field value for a board
-- `profiles_filter_by_flag BOARDS_CSV` — Return profiles matching the `--boards` selection
-- Uses `jq` for JSON parsing (declared dependency)
+## 5. Configuration Additions (FR-11, FR-12)
 
-### 3.4 `ardconfig-setup` (FR-1, FR-2, FR-3, FR-5.1)
-
-**Flow:**
-1. Parse args (`--boards`, `--non-interactive`, `--json`, `--quiet`)
-2. **System access (FR-1):**
-   - Check dialout group → `usermod -aG dialout $USER` if needed (sudo)
-   - Install `udev/99-arduino.rules` → `/etc/udev/rules.d/` (sudo)
-   - Reload udev rules (sudo)
-   - Verify serial port access
-3. **Tool installation (FR-2):**
-   - Install `arduino-cli` if missing (curl + install script to `~/.local/bin`, no sudo needed)
-   - Verify `~/.local/bin` is on `$PATH`; warn if not and suggest adding it
-   - Configure additional board manager URLs from selected profiles
-   - Install selected board cores (skip if already installed)
-4. **Python environment (FR-3):**
-   - Verify Python 3.10+
-   - Install `python3-venv`, `python3-pip` via apt if missing (sudo)
-   - Create `.venv` if not present
-   - Install `pyserial` into venv
-5. **Network discovery deps (FR-5.1):**
-   - Install `avahi-utils`, `nmap` via apt if missing (sudo)
-6. Emit result
-
-**Sudo operations** (collected and run together to minimize sudo prompts):
-- `usermod -aG dialout $USER`
-- `cp 99-arduino.rules /etc/udev/rules.d/`
-- `udevadm control --reload-rules && udevadm trigger`
-- `apt-get install -y python3-venv python3-pip avahi-utils nmap`
-
-### 3.5 `ardconfig-detect` (FR-4)
-
-**Flow:**
-1. Scan `/dev/ttyACM*` and `/dev/ttyUSB*`
-2. For each device, read udev properties via `udevadm info`
-3. Filter by vendor ID `2341`
-4. Match against board profiles by `usb_product_id` (if `jq` and profiles are available)
-5. Check read/write permission on each device
-6. Emit results (device path, product ID, board name, FQBN, accessible)
-
-**Degraded mode (no jq or profiles):** If `jq` is not installed or profiles are not found, detect still works using pure udev scanning. It reports device path, vendor/product ID, USB model string, and accessibility — but cannot resolve FQBN or board name. A `[WARN]` is emitted advising the user to run `ardconfig-setup` or install `jq` for full board identification.
-
-**No sudo required.**
-
-### 3.6 `ardconfig-discover` (FR-5)
-
-**Fallback chain:**
-1. **mDNS:** `avahi-browse -t -r _arduino._tcp 2>/dev/null` — look for Arduino service advertisements
-2. **Known MACs:** If `conf/known-macs.conf` or `--mac` provided, check ARP table (`ip neigh`) for those MACs
-3. **ARP scan:** Scan ARP table for entries matching Arduino OUI prefixes from board profiles
-4. **nmap:** `nmap -sn <subnet> | grep -i arduino` — ping sweep as last resort
-
-Results are deduplicated by MAC address. Each result includes the discovery method used.
-
-**No sudo required** (nmap ping sweep works without sudo on local subnet).
-
-### 3.7 `ardconfig-verify` (FR-6)
-
-**Flow:**
-1. If `--fqbn` and `--port` provided, verify that specific board
-2. Otherwise, detect connected boards (call detect logic), verify each
-3. For each board:
-   - Generate a Blink sketch from `templates/blink.ino`, substituting the board's `blink_led_pin`
-   - Compile: `arduino-cli compile --fqbn <fqbn> <sketch_dir>`
-   - If board connected and `--upload` flag: upload via `arduino-cli upload --fqbn <fqbn> --port <port>`
-4. Report compile/upload results per board
-
-### 3.8 `ardconfig-health` (FR-7)
-
-**Orchestrator script.** Runs checks in sequence, aggregates results:
-
-1. **System access:** dialout group membership, udev rules present, serial port permissions
-2. **Tools:** arduino-cli installed + version, board cores installed + versions
-3. **Python:** Python version, venv exists, pyserial installed
-4. **Board detection:** Run detect, report connected boards
-5. **Network discovery deps:** avahi-utils and nmap installed
-6. **Build verification:** Compile Blink for each installed core (no upload by default)
-
-Each check is a function that returns a step result. The health script aggregates all steps and emits a summary.
-
-## 4. udev Rules Design
-
-File: `udev/99-arduino.rules`
-
-```
-# Arduino devices — grant all users access
-SUBSYSTEM=="tty", ATTRS{idVendor}=="2341", MODE="0666"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="2341", MODE="0666"
-```
-
-This provides immediate access without requiring the user to be in the dialout group. The dialout group addition is a belt-and-suspenders approach for long-term correctness.
-
-## 5. Configuration File
-
-File: `conf/ardconfig.conf`
+Append to `conf/ardconfig.conf`:
 
 ```bash
-# Default boards to install (comma-separated)
-# Options: uno-q, r4wifi, giga
-ARDCONFIG_BOARDS="uno-q,r4wifi,giga"
-
-# Python virtual environment path (relative to project root)
-ARDCONFIG_VENV_PATH=".venv"
-
-# Additional Python packages to install in venv
-ARDCONFIG_PYTHON_PACKAGES="pyserial"
-
-# arduino-cli version (empty = install latest, record what was installed)
-# Set to pin a specific version, e.g., "1.1.1"
-ARDCONFIG_CLI_VERSION=""
+# AI onboarding settings (used by ardconfig-onboard)
+ARDCONFIG_BEDROCK_MODEL=""  # Default: us.anthropic.claude-sonnet-4-6
+ARDCONFIG_AWS_REGION=""     # Default: us-west-2 (falls back to AWS_DEFAULT_REGION)
 ```
 
-Scripts read this file if present, with command-line flags taking precedence.
+Empty values mean "use default." Environment variables override config file values.
 
-## 6. Known MACs Configuration
+Resolution order for model:
+1. `ARDCONFIG_BEDROCK_MODEL` env var
+2. `ARDCONFIG_BEDROCK_MODEL` in ardconfig.conf
+3. Default: `us.anthropic.claude-sonnet-4-6`
 
-File: `conf/known-macs.conf`
+Resolution order for region:
+1. `ARDCONFIG_AWS_REGION` env var
+2. `ARDCONFIG_AWS_REGION` in ardconfig.conf
+3. `AWS_DEFAULT_REGION` env var
+4. Default: `us-west-2`
 
-```bash
-# Known Arduino board MAC addresses for network discovery
-# Format: MAC_ADDRESS BOARD_ID LABEL
-# Used in environments with MAC-based WiFi registration (e.g., unfabric)
-DA:E3:4A:01:23:45 uno-q "Lab Uno Q #1"
-2C:AB:33:67:89:AB r4wifi "Bench R4 WiFi"
+---
+
+## 6. Data Flow
+
+```
+1. INPUT RESOLUTION
+   ┌─────────────────────┐     ┌──────────────────────┐
+   │ --vendor-id/         │     │ Scan /dev/ttyACM*    │
+   │ --product-id/        │ OR  │ /dev/ttyUSB* for     │
+   │ --board-name         │     │ unknown devices      │
+   └──────────┬──────────┘     └──────────┬───────────┘
+              └──────────┬───────────────┘
+                         ▼
+2. JIT DEPS          Check & install strands-agents, boto3
+                         │
+3. CREDENTIAL CHECK  Verify AWS credentials & Bedrock access
+                         │
+4. AGENT INVOCATION  Pass {vendor_id, product_id, board_name} to Python agent
+                         │
+                         ▼
+5. AI RESEARCH       ┌─────────────────────────────────────┐
+                     │ Strands Agent:                       │
+                     │  a. Read existing profile (schema)   │
+                     │  b. arduino-cli board listall/search │
+                     │  c. Web search for board docs        │
+                     │  d. Generate profile JSON            │
+                     │  e. Validate via bash subprocess     │
+                     │  f. Run ardconfig-setup              │
+                     │  g. Run ardconfig-verify             │
+                     │  h. If f/g fail: adjust & retry (×2) │
+                     └──────────────┬──────────────────────┘
+                                    │
+6. CONFIRMATION      Display profile → user approves (or auto in --non-interactive)
+                                    │
+7. WRITE             Write profiles/<id>.json
+                                    │
+8. UDEV UPDATE       Append vendor ID rule if new → reload udev
+                                    │
+9. RESULT            Emit success/failure via output.sh
 ```
 
-The discover script reads this file and checks the ARP table for these specific MACs before falling back to broader scans.
+---
 
-## 7. Blink Template
+## 7. Error Handling & Retry
 
-File: `templates/blink.ino`
+### Agent Retry Logic (FR-21)
 
-```cpp
-// ardconfig verification sketch
-// LED pin resolved from board profile or LED_BUILTIN
-#ifndef ARDCONFIG_LED_PIN
-#define ARDCONFIG_LED_PIN LED_BUILTIN
-#endif
+The agent has a retry budget of **2 additional attempts** after the initial try. Retries are triggered when:
+- `ardconfig-setup` fails (e.g., wrong core name, bad board manager URL)
+- `ardconfig-verify` fails (e.g., wrong FQBN, compilation error)
 
-void setup() {
-  pinMode(ARDCONFIG_LED_PIN, OUTPUT);
-  Serial.begin(115200);
-  Serial.println("ardconfig: verify OK");
-}
+On each retry, the agent receives the error output and is prompted to diagnose and correct the profile. The agent can modify any profile field and re-run the failed step.
 
-void loop() {
-  digitalWrite(ARDCONFIG_LED_PIN, HIGH);
-  delay(500);
-  digitalWrite(ARDCONFIG_LED_PIN, LOW);
-  delay(500);
-}
-```
+After 3 total attempts (1 initial + 2 retries), the agent reports failure with the last error.
 
-The verify script adds `-DARDCONFIG_LED_PIN=<pin>` to the compile flags only when the board profile specifies a numeric `blink_led_pin`. Otherwise `LED_BUILTIN` is used via the `#ifndef` fallback.
+### Failure Modes
 
-## 8. Dependency Summary
-
-| Dependency | Required by | Install method |
+| Failure | Exit Code | Behavior |
 |---|---|---|
-| bash 4.0+ | All scripts | Pre-installed |
-| jq | Board profile parsing | apt (installed by setup) |
-| curl | arduino-cli install | Pre-installed on Ubuntu |
-| arduino-cli | FR-2, FR-6 | Official install script |
-| python3, python3-venv, python3-pip | FR-3 | apt |
-| avahi-utils | FR-5 (mDNS) | apt |
-| nmap | FR-5 (fallback scan) | apt |
-| pyserial | FR-3, FR-4 | pip (in venv) |
-| udevadm | FR-1 | Pre-installed (systemd) |
+| No Python venv | 2 | Fail fast, suggest `ardconfig-setup` |
+| AI deps install fails | 2 | Fail fast, show pip error |
+| No AWS credentials | 2 | Fail fast, show credential setup instructions |
+| Bedrock API error | 1 | Report error, suggest checking model access |
+| No unknown USB devices | 3 | Report "no unknown hardware found" |
+| AI can't identify board | 4 | Output partial template with TODO fields, suggest Kiro (FR-24) |
+| Profile validation fails | 1 | Agent retries; if exhausted, report validation error |
+| Setup fails after retries | 4 | Profile written but setup incomplete |
+| Verify fails after retries | 4 | Profile written, core installed, but verify failed |
+| Profile ID conflict | — | Prompt user for override (FR-17) |
 
-## 9. Error Handling Strategy
+---
 
-- Each script wraps operations in functions that return step results
-- On failure, the step is recorded with status `error` and the detail message
-- Scripts continue to the next step unless the failure is fatal (e.g., no sudo when required)
-- The final exit code reflects the worst status: all ok → 0, any error → 1, missing prereqs → 2, no hardware → 3, mixed → 4
-- Stderr is captured for failed commands and included in the JSON `detail` field
+## 8. Security Considerations
 
-## 10. Alternatives Considered
+- **AWS credentials**: Never logged, echoed, or written to files. The Python agent uses boto3's default credential chain.
+- **File write restriction**: The `write_file` tool is restricted to the `profiles/` directory. Path traversal attempts are rejected.
+- **Subprocess execution**: Tools that run shell commands use explicit argument lists (no shell=True) to prevent injection.
+- **Udev rule update**: Requires sudo, follows existing `require_sudo`/`run_sudo` pattern from common.sh.
 
-### Monolithic setup script vs. separate scripts
-**Chosen: Separate scripts.** Each script has a single responsibility and can be invoked independently by agents. A monolithic script would be harder to invoke selectively and harder to test.
+---
 
-### Python-based tooling vs. bash
-**Chosen: Bash.** The scripts configure system-level resources (udev, groups, apt packages) where bash is the natural tool. Python would add a bootstrap dependency problem (need Python to install Python). The shared output library keeps bash manageable.
+## 9. Alternatives Considered
 
-### Hardcoded board support vs. profile-based
-**Chosen: Profile-based.** Board profiles decouple board knowledge from script logic. Adding the Uno R4 WiFi was trivial — just a new JSON file. When the Zephyr core stabilizes or new boards arrive, only a profile needs updating.
+### A1: Pure Python implementation (no bash wrapper)
 
-### arduino-cli `board list` for detection vs. udev scanning
-**Chosen: udev scanning.** `arduino-cli board list` requires arduino-cli to be installed and configured. The detect script needs to work before setup is complete (for diagnostics). udev properties are always available.
+**Rejected.** All existing ardconfig scripts are bash. A pure Python entry point would break the uniform CLI pattern (arg parsing via common.sh, output via output.sh, exit codes). The bash wrapper maintains consistency while delegating AI work to Python.
 
-## 11. Risks and Mitigations
+### A2: Integrate onboarding into ardconfig-detect
 
-| Risk | Mitigation |
-|---|---|
-| Zephyr core BETA instability | Board profile includes `notes` field; health check warns about beta cores |
-| arduino-cli install script changes | Install to `~/.local/bin`; pin version via `ARDCONFIG_CLI_VERSION` in conf; install latest by default and record installed version in health check output |
-| nmap not available or blocked | nmap is the last fallback; mDNS and ARP work without it |
-| jq not pre-installed | Setup installs jq as first apt operation; detect/discover work in degraded mode without jq (pure udev/ARP scan, no profile enrichment) with a clear warning |
-| Board profile schema changes | Profiles are versioned; `board-profiles.sh` validates required fields on load |
-| MAC OUI prefixes unknown for new boards | Ship profiles with empty OUI lists; rely on `known-macs.conf` for lab environments; document how to discover and populate OUIs |
-| `~/.local/bin` not on PATH | Setup checks PATH after install; emits warning with shell-specific instructions to add it |
+**Rejected.** Violates single-responsibility. Detect should detect; onboard should onboard. Detect can suggest running onboard when unknown devices are found.
+
+### A3: Use LangChain instead of Strands AI SDK
+
+**Rejected.** User specified Strands AI SDK. It's also lighter-weight and purpose-built for Bedrock.
+
+### A4: Reimplement profile validation in Python
+
+**Rejected.** Duplicates logic. The bash validation in board-profiles.sh is the single source of truth (OQ10). Calling it via subprocess keeps validation consistent.
+
+### A5: Have the agent write the profile directly without bash wrapper confirmation
+
+**Rejected.** Human-in-the-loop is a stated requirement (G5, FR-16). The bash wrapper handles confirmation because it owns the user interaction.
+
+### A6: Store agent tools as separate script files
+
+**Rejected.** Adds unnecessary file sprawl. A single `tools.py` module with decorated functions is the Strands AI SDK convention and keeps the agent self-contained.

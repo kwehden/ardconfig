@@ -1,0 +1,15 @@
+{
+  "id": "nucleo-f411re",
+  "name": "STM32 Nucleo-F411RE",
+  "fqbn": "STMicroelectronics:stm32:Nucleo_64:pnum=NUCLEO_F411RE",
+  "core": "STMicroelectronics:stm32",
+  "core_url": "https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json",
+  "usb_vendor_id": "0483",
+  "usb_product_id": "374b",
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "STM32F411RE Nucleo-64 board by STMicroelectronics. Onboard ST-Link V2-1 (USB VID 0483 PID 374b) provides programming, debugging, and a virtual COM port. LED_BUILTIN maps to PA5."
+}
