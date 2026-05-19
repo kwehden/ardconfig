@@ -269,7 +269,7 @@ Each board is described by a JSON profile. To add a new board, you have two opti
 
 **Uno Q notes** — The Zephyr core is BETA. First use requires a bootloader burn (double-click RESET button, then use `arduino-cli burn-bootloader`). Library compatibility is limited compared to R4 WiFi and Giga.
 
-**Arduino 101 upload** — `arduino-cli upload` cannot trigger the DFU reset via 1200 bps touch on this board. Upload requires manually pressing MASTER_RESET to enter DFU mode (USB PID `8087:0aba`), then flashing with `dfu-util` directly:
+**Arduino 101 upload** — `arduino-cli upload` cannot trigger the DFU reset via 1200 bps touch on this board. Upload requires manually pressing MASTER_RESET to enter DFU mode (USB PID `8087:0aba`), then flashing with `dfu-util` directly (`ardconfig-setup` installs `dfu-util` automatically):
 
 ```bash
 dfu-util -d 8087:0aba -a 7 -D sketch.bin
@@ -279,7 +279,7 @@ The `-a 7` argument targets alt setting 7 (`sensor_core`). After flashing, press
 
 Two additional requirements for DFU access without root:
 
-- The Intel `arc32` udev rules (VID `8087`) must be present in `/etc/udev/rules.d/99-arduino.rules`. Running `ardconfig-setup` with the `uno-101` profile installs them.
+- The Intel Arduino 101 udev rules (PIDs `0ab6`/`0aba`) must be present in `/etc/udev/rules.d/99-arduino.rules`. Running `ardconfig-setup` with the `uno-101` profile installs them.
 - `ModemManager` will claim the port and block both uploads and serial reads. Mask it permanently:
 
 ```bash

@@ -6,6 +6,9 @@
   "core_url": "",
   "usb_vendor_id": "2341",
   "usb_product_id": "0043",
+  "usb_alt_chips": [
+    {"vendor_id": "2a03", "product_id": "0043", "chip": "Arduino SA alternate VID"}
+  ],
   "usb_driver": "cdc_acm",
   "serial_pattern": "/dev/ttyACM*",
   "network_discoverable": false,

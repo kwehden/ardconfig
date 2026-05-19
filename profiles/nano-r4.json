@@ -3,6 +3,7 @@
   "name": "Arduino Nano R4",
   "fqbn": "arduino:renesas_uno:nanor4",
   "core": "arduino:renesas_uno",
+  "core_min_version": "1.5.0",
   "core_url": "",
   "usb_vendor_id": "2341",
   "usb_product_id": "0074",
