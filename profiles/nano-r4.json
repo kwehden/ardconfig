@@ -1,0 +1,15 @@
+{
+  "id": "nano-r4",
+  "name": "Arduino Nano R4",
+  "fqbn": "arduino:renesas_uno:nanor4",
+  "core": "arduino:renesas_uno",
+  "core_url": "",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "0074",
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "Renesas RA4M1-based Nano form factor. Shares the arduino:renesas_uno core with the Uno R4 family. USB interfaces include a DFU endpoint (fe0101)."
+}

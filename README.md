@@ -8,6 +8,7 @@ Reusable bootstrap package for configuring Ubuntu systems to develop with Arduin
 |---|---|---|---|
 | Arduino Uno R3 | `uno-r3` | `arduino:avr:uno` | `arduino:avr` |
 | Arduino Uno Q | `uno-q` | `arduino:zephyr:unoq` | `arduino:zephyr` (BETA) |
+| Arduino Nano R4 | `nano-r4` | `arduino:renesas_uno:nanor4` | `arduino:renesas_uno` |
 | Arduino Uno R4 WiFi | `r4wifi` | `arduino:renesas_uno:unor4wifi` | `arduino:renesas_uno` |
 | Arduino Giga R1 WiFi | `giga` | `arduino:mbed_giga:giga` | `arduino:mbed_giga` |
 | Arduino 101 | `uno-101` | `Intel:arc32:arduino_101` | `Intel:arc32` (deprecated) |
@@ -306,6 +307,7 @@ ardconfig/
 │   └── board-profiles.sh   # Board profile loader
 ├── profiles/               # Board profile JSON files
 │   ├── uno-r3.json
+│   ├── nano-r4.json
 │   ├── uno-q.json
 │   ├── r4wifi.json
 │   ├── giga.json
