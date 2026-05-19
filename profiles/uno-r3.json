@@ -1,0 +1,18 @@
+{
+  "id": "uno-r3",
+  "name": "Arduino Uno R3",
+  "fqbn": "arduino:avr:uno",
+  "core": "arduino:avr",
+  "core_url": "",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "0043",
+  "usb_alt_chips": [
+    {"vendor_id": "2a03", "product_id": "0043", "chip": "Arduino SA alternate VID"}
+  ],
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "Classic AVR Uno R3 using ATmega16U2 as USB bridge (CDC ACM). Product ID 0042 is the DFU/bootloader variant."
+}

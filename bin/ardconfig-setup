@@ -129,6 +129,9 @@ collect_apt_packages() {
   # Network discovery (FR-5.1)
   command -v avahi-browse &>/dev/null || pkgs+=(avahi-utils)
   command -v nmap &>/dev/null || pkgs+=(nmap)
+
+  # DFU upload tool (required for boards like Arduino 101)
+  command -v dfu-util &>/dev/null || pkgs+=(dfu-util)
 }
 
 install_apt_packages() {
@@ -201,6 +204,11 @@ setup_arduino_cli() {
     || output_step warn core_index "Failed to update core index (may work offline)"
 }
 
+# Returns 0 if installed version $1 satisfies minimum version $2
+_version_gte() {
+  [ "$(printf '%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+}
+
 setup_board_cores() {
   local selected
   selected=$(profiles_filter "$ARG_BOARDS")
@@ -208,14 +216,26 @@ setup_board_cores() {
   count=$(echo "$selected" | jq 'length')
 
   for i in $(seq 0 $((count - 1))); do
-    local board_id core
+    local board_id core min_ver
     board_id=$(echo "$selected" | jq -r ".[$i].id")
     core=$(echo "$selected" | jq -r ".[$i].core")
+    min_ver=$(echo "$selected" | jq -r ".[$i].core_min_version // empty")
 
     if arduino-cli core list 2>/dev/null | grep -q "^${core}"; then
       local ver
       ver=$(arduino-cli core list 2>/dev/null | grep "^${core}" | awk '{print $2}')
-      output_step skip "core_install_${board_id}" "Core ${core} already installed (${ver})"
+      if [[ -n "$min_ver" ]] && ! _version_gte "$ver" "$min_ver"; then
+        output_step info "core_install_${board_id}" "Core ${core} ${ver} below minimum ${min_ver} — upgrading..."
+        local install_out
+        install_out=$(arduino-cli core install "$core" 2>&1)
+        if [[ $? -eq 0 ]]; then
+          output_step ok "core_install_${board_id}" "Upgraded core: ${core} (>= ${min_ver})"
+        else
+          output_step error "core_install_${board_id}" "Failed to upgrade core: ${core}" "$install_out"
+        fi
+      else
+        output_step skip "core_install_${board_id}" "Core ${core} already installed (${ver})"
+      fi
     else
       output_step info "core_install_${board_id}" "Installing core ${core} (this may take a few minutes)..."
       local install_out

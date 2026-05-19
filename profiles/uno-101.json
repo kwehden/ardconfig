@@ -1,0 +1,18 @@
+{
+  "id": "uno-101",
+  "name": "Arduino 101",
+  "fqbn": "Intel:arc32:arduino_101",
+  "core": "Intel:arc32",
+  "core_url": "",
+  "usb_vendor_id": "8087",
+  "usb_product_id": "0ab6",
+  "usb_alt_chips": [
+    {"vendor_id": "8087", "product_id": "0aba", "chip": "DFU programming mode"}
+  ],
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "Intel Curie SoC (x86 Quark SE + ARC EM4, 32 MHz). 196 KB Flash, 24 KB SRAM. Built-in BLE (Nordic nRF51822) and 6-axis IMU (Bosch BMI160). Discontinued 2017; Intel:arc32 core is deprecated. PID 0aba is DFU programming mode (observed when MASTER_RESET is pressed)."
+}
