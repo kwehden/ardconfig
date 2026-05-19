@@ -6,14 +6,18 @@ Reusable bootstrap package for configuring Ubuntu systems to develop with Arduin
 
 | Board | Profile ID | FQBN | Core |
 |---|---|---|---|
+| Arduino Uno R3 | `uno-r3` | `arduino:avr:uno` | `arduino:avr` |
 | Arduino Uno Q | `uno-q` | `arduino:zephyr:unoq` | `arduino:zephyr` (BETA) |
 | Arduino Uno R4 WiFi | `r4wifi` | `arduino:renesas_uno:unor4wifi` | `arduino:renesas_uno` |
 | Arduino Giga R1 WiFi | `giga` | `arduino:mbed_giga:giga` | `arduino:mbed_giga` |
+| Arduino 101 | `uno-101` | `Intel:arc32:arduino_101` | `Intel:arc32` (deprecated) |
 | STM32 Nucleo-F411RE | `nucleo-f411re` | `STMicroelectronics:stm32:Nucleo_64:pnum=NUCLEO_F411RE` | `STMicroelectronics:stm32` |
 
 The **Giga Display Shield** (ASX00039) is a peripheral that attaches to the Giga R1 WiFi board — the `giga` profile covers both.
 
 The **Nucleo-F411RE** is the first non-Arduino-branded board, onboarded via the AI-powered `ardconfig-onboard` flow.
+
+The **Arduino 101** uses the `Intel:arc32` core, which was discontinued in 2017 and is no longer maintained. Upload requires a non-standard DFU flow — see the Arduino 101 upload entry in Troubleshooting.
 
 ## Prerequisites
 
@@ -122,6 +126,27 @@ bin/ardconfig-discover --json                        # JSON output
 For MAC-registered networks (e.g., unfabric), configure `conf/known-macs.conf`:
 ```
 DA:E3:4A:01:23:45 uno-q "Lab Uno Q #1"
+```
+
+### Templates
+
+#### `templates/i2c-scan.ino`
+
+Scans all 127 I2C addresses (0x01–0x7F) and prints results over serial at 115200 baud. Runs once at startup; re-flash or reset the board to repeat the scan.
+
+```bash
+arduino-cli compile --fqbn arduino:avr:uno templates/i2c-scan.ino
+arduino-cli upload  --fqbn arduino:avr:uno --port /dev/ttyACM0 templates/i2c-scan.ino
+```
+
+Open the serial monitor at 115200 to see output:
+
+```
+ardconfig: I2C scan
+Scanning addresses 0x01-0x7F...
+  [FOUND] 0x3C (60)
+  Total: 1 device(s).
+Done.
 ```
 
 ### `ardconfig-verify`
@@ -243,6 +268,23 @@ Each board is described by a JSON profile. To add a new board, you have two opti
 
 **Uno Q notes** — The Zephyr core is BETA. First use requires a bootloader burn (double-click RESET button, then use `arduino-cli burn-bootloader`). Library compatibility is limited compared to R4 WiFi and Giga.
 
+**Arduino 101 upload** — `arduino-cli upload` cannot trigger the DFU reset via 1200 bps touch on this board. Upload requires manually pressing MASTER_RESET to enter DFU mode (USB PID `8087:0aba`), then flashing with `dfu-util` directly:
+
+```bash
+dfu-util -d 8087:0aba -a 7 -D sketch.bin
+```
+
+The `-a 7` argument targets alt setting 7 (`sensor_core`). After flashing, press the regular reset button (not MASTER_RESET) to boot the sketch.
+
+Two additional requirements for DFU access without root:
+
+- The Intel `arc32` udev rules (VID `8087`) must be present in `/etc/udev/rules.d/99-arduino.rules`. Running `ardconfig-setup` with the `uno-101` profile installs them.
+- `ModemManager` will claim the port and block both uploads and serial reads. Mask it permanently:
+
+```bash
+sudo systemctl mask ModemManager
+```
+
 ## Project Structure
 
 ```
@@ -263,15 +305,18 @@ ardconfig/
 │   ├── common.sh           # Arg parsing, exit codes, sudo helpers
 │   └── board-profiles.sh   # Board profile loader
 ├── profiles/               # Board profile JSON files
+│   ├── uno-r3.json
 │   ├── uno-q.json
 │   ├── r4wifi.json
 │   ├── giga.json
+│   ├── uno-101.json        # Arduino 101 (deprecated Intel:arc32 core)
 │   └── nucleo-f411re.json  # AI-generated
 ├── conf/                   # Configuration
 │   ├── ardconfig.conf
 │   └── known-macs.conf.example
 ├── templates/              # Sketch templates
-│   └── blink.ino
+│   ├── blink.ino
+│   └── i2c-scan.ino
 ├── udev/                   # udev rule templates
 │   └── 99-arduino.rules
 └── spec/                   # Design documents
