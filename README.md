@@ -150,6 +150,43 @@ Scanning addresses 0x01-0x7F...
 Done.
 ```
 
+#### `templates/clock/`
+
+Full-screen 24h clock with 3-day weather forecast for the Arduino Giga R1 WiFi + Giga Display Shield (800x480). Features:
+
+- Large FreeSans time display (upper left) and date (upper right)
+- 3-day forecast grid with drawn weather icons (sun, clouds, rain, snow) and temperatures
+- Touch anywhere in the forecast area to toggle between Celsius and Fahrenheit
+- Weather data sourced from [wttr.in](https://wttr.in) via the included sync script
+
+**Required hardware:** Arduino Giga R1 WiFi + Giga Display Shield (ASX00039)
+
+**Required libraries:** `Arduino_GigaDisplay_GFX`, `Arduino_GigaDisplayTouch` (installed automatically by `arduino-cli lib install`)
+
+```bash
+arduino-cli lib install "Arduino_GigaDisplay_GFX" "Arduino_GigaDisplayTouch"
+arduino-cli compile --fqbn arduino:mbed_giga:giga templates/clock/clock.ino
+arduino-cli upload  --fqbn arduino:mbed_giga:giga --port /dev/ttyACM0 templates/clock/clock.ino
+```
+
+Sync time and weather forecast from the host:
+
+```bash
+templates/clock/sync.sh /dev/ttyACM0
+```
+
+The sync script sends the current time, date, and 3-day forecast over serial. Run it after each power cycle or set up a cron job to keep the display current:
+
+```bash
+*/15 * * * * /path/to/ardconfig/templates/clock/sync.sh /dev/ttyACM0
+```
+
+Serial protocol:
+- Time/date: `T HH:MM:SS YYYY-MM-DD`
+- Forecast: `W DayName,temp,code,temp,code,temp,code,temp,code|Day2,...|Day3,...`
+
+Weather codes follow the [wttr.in weather code scheme](https://github.com/chubin/wttr.in).
+
 ### `ardconfig-verify`
 
 Compiles a Blink test sketch for each installed board core.
