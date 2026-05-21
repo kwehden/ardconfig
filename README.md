@@ -12,6 +12,7 @@ Reusable bootstrap package for configuring Ubuntu systems to develop with Arduin
 | Arduino Uno R4 WiFi | `r4wifi` | `arduino:renesas_uno:unor4wifi` | `arduino:renesas_uno` |
 | Arduino Giga R1 WiFi | `giga` | `arduino:mbed_giga:giga` | `arduino:mbed_giga` |
 | Arduino 101 | `uno-101` | `Intel:arc32:arduino_101` | `Intel:arc32` (deprecated) |
+| Arduino Portenta C33 | `portenta-c33` | `arduino:renesas_portenta:portenta_c33` | `arduino:renesas_portenta` |
 | STM32 Nucleo-F411RE | `nucleo-f411re` | `STMicroelectronics:stm32:Nucleo_64:pnum=NUCLEO_F411RE` | `STMicroelectronics:stm32` |
 
 The **Giga Display Shield** (ASX00039) is a peripheral that attaches to the Giga R1 WiFi board — the `giga` profile covers both.
