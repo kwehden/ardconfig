@@ -1,0 +1,16 @@
+{
+  "id": "portenta-c33",
+  "name": "Arduino Portenta C33",
+  "fqbn": "arduino:renesas_portenta:portenta_c33",
+  "core": "arduino:renesas_portenta",
+  "core_url": "",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "0068",
+  "usb_alt_chips": [],
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": true,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LEDR",
+  "notes": "Portenta C33 with Renesas RA6M5 MCU (Cortex-M33). WiFi/BLE capable. USB descriptor reports as 'Portenta_H33'. Uses RGB LED — LEDR, LEDG, LEDB available (active LOW)."
+}
