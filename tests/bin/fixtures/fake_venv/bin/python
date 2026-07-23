@@ -50,6 +50,18 @@
 #     asserting it exists by reading the source), while every other
 #     invocation shape (e.g. ensure_ai_deps()'s `-c "import ollama"`
 #     checks) still sees a fully real, working interpreter.
+#
+#   delegate_no_ollama_submodule
+#     Delegates to the real project venv's python for every invocation
+#     EXCEPT any `-c` command that references `strands.models.ollama`,
+#     which is forced to fail (exit 1) without ever touching the real
+#     interpreter. Simulates an earlier strands-agents install (from the
+#     former Bedrock-only flow) where bare `import strands` succeeds but
+#     the ollama model submodule doesn't exist yet — the exact gap
+#     ensure_ai_deps()'s provider-conditional OllamaModel probe exists to
+#     catch. Every other invocation (bare `import strands`, `import
+#     boto3`, `import ollama`, check_ollama_available()'s heredoc, etc.)
+#     sees a fully real, working interpreter.
 set -euo pipefail
 
 REAL_VENV_PYTHON="${ARDCONFIG_TEST_REAL_VENV_PYTHON:?ARDCONFIG_TEST_REAL_VENV_PYTHON must be set}"
@@ -76,8 +88,16 @@ EOJSON
       exec "$REAL_VENV_PYTHON" "$@"
     fi
     ;;
+  delegate_no_ollama_submodule)
+    for arg in "$@"; do
+      if [[ "$arg" == *"strands.models.ollama"* ]]; then
+        exit 1
+      fi
+    done
+    exec "$REAL_VENV_PYTHON" "$@"
+    ;;
   *)
-    echo "fake_venv/bin/python: \$ARDCONFIG_TEST_FIXTURE_MODE must be 'missing_deps', 'delegate', or 'delegate_no_ollama' (got '${ARDCONFIG_TEST_FIXTURE_MODE:-<unset>}')" >&2
+    echo "fake_venv/bin/python: \$ARDCONFIG_TEST_FIXTURE_MODE must be 'missing_deps', 'delegate', 'delegate_no_ollama', or 'delegate_no_ollama_submodule' (got '${ARDCONFIG_TEST_FIXTURE_MODE:-<unset>}')" >&2
     exit 1
     ;;
 esac

@@ -242,6 +242,53 @@ _start_mock_ollama() {
 }
 
 # ---------------------------------------------------------------------
+# P1 review finding (PR #4, chatgpt-codex-connector, bin/ardconfig-onboard:80):
+# a strands-agents install from the former Bedrock-only flow can pass a
+# bare `import strands` probe while lacking `strands.models.ollama` — the
+# provider now defaults to ollama, so that gap must be caught by
+# ensure_ai_deps() (a clear "please upgrade" prereq message) rather than
+# surfacing as an opaque agent crash deep inside create_agent(). Uses the
+# fake_venv fixture's `delegate_no_ollama_submodule` mode, which forces
+# only the OllamaModel-capability probe to fail while every other
+# invocation (including check_ollama_available()'s real HTTP call) stays
+# genuinely real.
+# ---------------------------------------------------------------------
+
+@test "P1 fix: strands importable but strands.models.ollama missing (stale pre-Ollama install) triggers a pinned strands-agents reinstall, not a silent pass-through" {
+  port="$(_free_port)"  # nothing listening; keeps the run fast/offline/deterministic
+  _run_onboard "$FAKE_VENV" \
+    ARDCONFIG_LLM_PROVIDER=ollama \
+    ARDCONFIG_OLLAMA_HOST="http://127.0.0.1:${port}" \
+    ARDCONFIG_TEST_FIXTURE_MODE=delegate_no_ollama_submodule \
+    ARDCONFIG_TEST_REAL_VENV_PYTHON="$REAL_VENV_PYTHON" \
+    ARDCONFIG_TEST_FAKE_PIP_LOG="${BATS_TEST_TMPDIR}/pip.log" \
+    "$ONBOARD" --json --non-interactive --vendor-id 0000 --product-id 0000
+
+  # ensure_ai_deps() must detect the missing OllamaModel capability and
+  # queue a pinned strands-agents upgrade (not proceed as if all deps
+  # were satisfied).
+  deps_msg="$(echo "$output" | jq -r '[.steps[] | select(.name == "deps")][0].message')"
+  [[ "$deps_msg" == *"strands-agents>=1.40.0"* ]]
+  [[ "$deps_msg" != *"boto3"* ]]
+  [[ "$deps_msg" != *"ollama>="* ]]
+
+  # The reinstall must actually be attempted (fake pip logs its args),
+  # confirming ensure_ai_deps() acted on the failed probe rather than
+  # merely logging it.
+  pip_log="$(cat "${BATS_TEST_TMPDIR}/pip.log")"
+  [[ "$pip_log" == *"strands-agents>=1.40.0"* ]]
+
+  # Execution must pass through the deps gate (and its upgrade) before
+  # reaching check_ollama_available() — proving it did not skip straight
+  # from llm_provider to ollama_reachable/agent invocation with a broken
+  # strands install. (ensure_ai_deps() emits two "deps" steps — the
+  # "Installing..." info step and the "installed" ok step — so this
+  # checks ordering/presence, not an exact step-name sequence.)
+  step_names="$(echo "$output" | jq -r '[.steps[].name] | join(",")')"
+  [[ "$step_names" == "llm_provider,deps,deps,ollama_reachable" ]]
+}
+
+# ---------------------------------------------------------------------
 # AC-010/AC-011 regression: the provider-conditional prereq dispatch
 # never calls the wrong check (regression-critical check #2 continuation
 # from the orchestrator's brief; also FR-23 amended's own AC).

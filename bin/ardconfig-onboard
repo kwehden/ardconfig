@@ -77,7 +77,22 @@ ensure_ai_deps() {
     exit "$EXIT_PREREQ"
   fi
   local missing=()
-  "${venv}/bin/python" -c "import strands" 2>/dev/null || missing+=(strands-agents)
+  if [[ "$ARDCONFIG_LLM_PROVIDER" == "ollama" ]]; then
+    # Probe the exact capability agent/onboard_agent.py's create_agent()
+    # needs for provider=ollama (`from strands.models.ollama import
+    # OllamaModel`), not bare `import strands`. An earlier install from
+    # the former Bedrock-only flow can have a strands-agents version that
+    # imports fine but predates the ollama model submodule, which would
+    # otherwise surface as an opaque agent crash instead of this prereq
+    # check's "please upgrade" message. Pinned to >=1.40.0 — the version
+    # this feature was developed/tested against, confirmed to provide
+    # OllamaModel with the constructor shape create_agent() relies on —
+    # rather than an unpinned bare package, so a failed probe upgrades to
+    # a known-good version instead of whatever pip happens to resolve.
+    "${venv}/bin/python" -c "from strands.models.ollama import OllamaModel" 2>/dev/null || missing+=("strands-agents>=1.40.0")
+  else
+    "${venv}/bin/python" -c "import strands" 2>/dev/null || missing+=(strands-agents)
+  fi
   "${venv}/bin/python" -c "import boto3" 2>/dev/null || missing+=(boto3)
   if [[ "$ARDCONFIG_LLM_PROVIDER" == "ollama" ]]; then
     "${venv}/bin/python" -c "import ollama" 2>/dev/null || missing+=("ollama>=0.4.8,<1.0.0")
