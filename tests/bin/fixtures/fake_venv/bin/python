@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Configurable fake "venv python" for tests/bin/test_ardconfig_onboard.bats.
+#
+# This is a test-harness fixture, not production code — it exists solely
+# to give bats deterministic, offline control over bin/ardconfig-onboard's
+# ensure_ai_deps()/check_ollama_available() prereq checks, without ever
+# risking a real (possibly slow/retrying) LLM/AWS call or mutating the
+# repo's real project .venv.
+#
+# Behavior is selected via $ARDCONFIG_TEST_FIXTURE_MODE:
+#
+#   missing_deps
+#     Every invocation fails immediately. Simulates a venv where
+#     strands/boto3/ollama are all uninstalled (AC-014's deps-list test).
+#     No real `pip install` is ever attempted as a result, since the
+#     sibling fake `pip` next to this script just records its args and
+#     reports success without touching the network.
+#
+#   delegate
+#     Delegates to the real project venv's python (which has
+#     strands/boto3/ollama genuinely installed) for every invocation
+#     EXCEPT `-m agent.onboard_agent`, which is short-circuited to print
+#     a canned JSON `{"status": "failure", ...}` response and exit 0
+#     (deliberately *not* a nonzero subprocess exit — invoke_agent()
+#     captures this subprocess via `agent_output=$(... | python -m
+#     agent.onboard_agent ...)` under the script's `set -euo pipefail`;
+#     a nonzero exit there falls into invoke_agent()'s own `|| { ...;
+#     exit "$EXIT_FAIL"; }` block, which runs *inside* the command-
+#     substitution subshell — so its output_step/output_result calls,
+#     and the `exit` itself, only affect that subshell and are silently
+#     discarded when set -e aborts the parent script at the failed
+#     assignment, before the real output_result ever runs. Exiting 0
+#     with valid JSON avoids that trap entirely and produces the
+#     observable, real output_result the tests assert on). Used for the
+#     "ollama check passes, execution proceeds" scenario:
+#     check_ollama_available()'s real `import ollama` + real HTTP call
+#     against the test's local mock server genuinely exercises
+#     production code, without ever letting invoke_agent() reach a real
+#     (and, against a mock server that doesn't implement chat/generate,
+#     potentially slow-retrying) LLM inference call.
+#
+#   delegate_no_ollama
+#     Delegates to the real project venv's python, EXCEPT for the exact
+#     stdin-heredoc invocation shape check_ollama_available() uses
+#     (`python -`), where it prepends `sys.modules['ollama'] = None`
+#     before piping the heredoc through — this makes that specific
+#     invocation's own `import ollama` genuinely raise ImportError,
+#     exercising check_ollama_available()'s own `except ImportError:
+#     print("DEPS_MISSING")` branch for real (rather than merely
+#     asserting it exists by reading the source), while every other
+#     invocation shape (e.g. ensure_ai_deps()'s `-c "import ollama"`
+#     checks) still sees a fully real, working interpreter.
+set -euo pipefail
+
+REAL_VENV_PYTHON="${ARDCONFIG_TEST_REAL_VENV_PYTHON:?ARDCONFIG_TEST_REAL_VENV_PYTHON must be set}"
+
+case "${ARDCONFIG_TEST_FIXTURE_MODE:-}" in
+  missing_deps)
+    exit 1
+    ;;
+  delegate)
+    for arg in "$@"; do
+      if [[ "$arg" == "agent.onboard_agent" ]]; then
+        cat <<'EOJSON'
+{"status": "failure", "error": "test fixture: agent invocation intentionally short-circuited (see tests/bin/fixtures/fake_venv/bin/python, delegate mode)"}
+EOJSON
+        exit 0
+      fi
+    done
+    exec "$REAL_VENV_PYTHON" "$@"
+    ;;
+  delegate_no_ollama)
+    if [[ "${1:-}" == "-" ]]; then
+      { printf '%s\n' "import sys; sys.modules['ollama'] = None"; cat; } | exec "$REAL_VENV_PYTHON" -
+    else
+      exec "$REAL_VENV_PYTHON" "$@"
+    fi
+    ;;
+  *)
+    echo "fake_venv/bin/python: \$ARDCONFIG_TEST_FIXTURE_MODE must be 'missing_deps', 'delegate', or 'delegate_no_ollama' (got '${ARDCONFIG_TEST_FIXTURE_MODE:-<unset>}')" >&2
+    exit 1
+    ;;
+esac

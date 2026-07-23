@@ -145,3 +145,95 @@ The immediate trigger is the Nucleo-F411RE (STMicroelectronics, USB vendor ID `0
 | **Board Profile** | A JSON file in `profiles/` describing a supported board's identity, toolchain configuration, and hardware characteristics. The atomic unit of board support in ardconfig. |
 | **Human-in-the-loop** | A workflow pattern where an AI system generates output but requires explicit human approval before taking action (writing files, modifying system state). |
 | **Vendor ID / Product ID** | USB identifiers (16-bit hex) assigned by the USB-IF. Used to identify the manufacturer and specific product of a USB device. |
+| **Ollama** | An open-source tool for running LLMs locally, exposing an HTTP API (default `http://localhost:11434`). Introduced as a second onboarding-agent backend in the §12 scope delta. |
+| **LLM Provider** | In this document (§12), "provider" means the onboarding agent's LLM backend selection (`bedrock` or `ollama`) — distinct from "board manager"/USB "vendor" terminology used elsewhere in this glossary. |
+
+---
+
+## 12. Scope Delta: Ollama as a Second LLM Provider (2026-07-20)
+
+**Status:** Approved at Gate 0 by the user. This section is additive to the Bedrock-only scope defined in §§1–11 above, which remains valid and unmodified. Nothing below removes or contradicts G7, C1–C13, FR-7/FR-11/FR-12/FR-22/FR-23, or AC-001–AC-009; it extends the LLM-backend boundary of the existing onboarding flow.
+
+### 12.1 Problem Statement (Delta)
+
+The existing onboarding agent (`agent/onboard_agent.py::create_agent()`) hardcodes `strands.models.bedrock.BedrockModel`, requiring AWS credentials and Bedrock model access for every onboarding run. The user's day-to-day workflow is local-first via Ollama (confirmed running locally: `gpt-oss:latest` is pulled and serving per `ollama list`/`ollama ps`). Requiring AWS for a task that can run entirely offline against a local model is an unnecessary barrier. The Strands SDK already ships a built-in `strands.models.ollama.OllamaModel` (confirmed at `.venv/lib/python3.14/site-packages/strands/models/ollama.py`, strands-agents 1.40.0) that wraps the `ollama` PyPI client — this delta wires it in as a selectable, default backend.
+
+### 12.2 Goals (Delta)
+
+- **GO1:** WHEN `ARDCONFIG_LLM_PROVIDER` is unset or set to `ollama` (the new default), the onboarding agent SHALL use `strands.models.ollama.OllamaModel` against a locally-configured Ollama server, requiring no AWS credentials and no AWS network egress.
+- **GO2:** WHEN `ARDCONFIG_LLM_PROVIDER=bedrock`, the onboarding agent SHALL behave identically to the pre-delta implementation (BedrockModel, AWS credential check, FR-7/FR-11/FR-12/FR-23 unchanged) — this is now the explicit opt-in path rather than the implicit default.
+- **GO3:** Prerequisite checks in `bin/ardconfig-onboard` SHALL become provider-conditional: `check_aws_credentials` runs only for `bedrock`; a new Ollama-reachability check runs only for `ollama`, failing fast (exit 2) before the agent is invoked.
+- **GO4:** `ensure_ai_deps()` SHALL JIT-install the `ollama` PyPI package only when provider=`ollama`, mirroring the existing strands-agents/boto3 JIT-install pattern (FR-22).
+- **GO5:** New configuration (`ARDCONFIG_LLM_PROVIDER`, `ARDCONFIG_OLLAMA_HOST`, `ARDCONFIG_OLLAMA_MODEL`) SHALL follow the existing `ARDCONFIG_*` env-var and `conf/ardconfig.conf` convention (C11), mirroring `ARDCONFIG_BEDROCK_MODEL`/`ARDCONFIG_AWS_REGION`.
+- **GO6:** No other part of the onboarding pipeline changes: agent tools (FR-8–FR-10), system prompt, profile schema (C6), validation (FR-15), udev handling (FR-18), or the setup/verify auto-run loop (FR-19–FR-21) are unaffected by provider selection.
+
+### 12.3 Non-Goals / Out of Scope (Delta)
+
+- **NGO1:** No support for any LLM provider other than `bedrock`/`ollama` in this pass, even though the Strands SDK's lazy `strands.models.__getattr__` loader exposes several others (Anthropic direct, Gemini, LiteLLM, OpenAI, etc.).
+- **NGO2:** No changes to `ardconfig-detect`, `ardconfig-discover`, `ardconfig-health`, `ardconfig-monitor`, `ardconfig-verify`, the board profile JSON schema, or udev rule handling.
+- **NGO3:** No new board profiles.
+- **NGO4:** No automatic cross-provider fallback (e.g., "try Ollama, fall back to Bedrock if unreachable"). Provider selection is explicit and single-valued per run.
+- **NGO5:** No management of Ollama itself — installing it, starting the server, or pulling models is the user's responsibility. `ensure_ai_deps()` installs the `ollama` **Python client package**, not the Ollama server/binary.
+- **NGO6:** No changes to agent tool definitions (`agent/tools.py`) or the system prompt in `agent/onboard_agent.py` — only the model-backend construction in `create_agent()` changes.
+
+### 12.4 Users & Use-Cases (Delta)
+
+- **UC4 — Local-first onboarding without AWS:** A developer without AWS credentials (or who prefers not to send hardware-research prompts to a cloud LLM) runs `ardconfig-onboard` with no special flags; it uses the local Ollama server by default and produces a profile with zero AWS network traffic.
+- **UC5 (extends UC3) — CI/agent explicitly pinning Bedrock:** An automated agent or CI pipeline without a local Ollama server sets `ARDCONFIG_LLM_PROVIDER=bedrock` explicitly to preserve pre-delta behavior.
+
+### 12.5 Constraints & Invariants (Delta)
+
+- **C14:** Provider selection SHALL be governed by a new env var `ARDCONFIG_LLM_PROVIDER` ∈ {`bedrock`, `ollama`}. An unrecognized value is a prerequisite/configuration error (exit 2), not a silent fallback to either provider. **Default: `ollama`** — this reverses the implicit Bedrock-only default of the pre-delta implementation (see R12, OQ11).
+- **C15:** New env vars `ARDCONFIG_OLLAMA_HOST` (default `http://localhost:11434`) and `ARDCONFIG_OLLAMA_MODEL` (default `gpt-oss:latest`) follow the `ARDCONFIG_*` naming convention and `conf/ardconfig.conf` pattern (C11).
+- **C16:** `bin/ardconfig-onboard`'s prereq phase becomes provider-conditional: `check_aws_credentials` (existing) runs only when provider=`bedrock`; a new reachability check runs only when provider=`ollama` and must exit 2 with a clear message if the Ollama server at `ARDCONFIG_OLLAMA_HOST` is unreachable, mirroring FR-23's fail-fast contract.
+- **C17:** `ensure_ai_deps()` JIT-installs the `ollama` PyPI package only when provider=`ollama`, following the existing missing-package-detection pattern used for `strands-agents`/`boto3`.
+- **C18 (verified):** `boto3` is an **unconditional** (non-`extra`) install dependency of `strands-agents` — confirmed via `.venv/lib/python3.14/site-packages/strands_agents-1.40.0.dist-info/METADATA`: `Requires-Dist: boto3<2.0.0,>=1.26.0` has no `extra ==` qualifier, whereas `ollama` is gated behind `Requires-Dist: ollama<1.0.0,>=0.4.8; extra == 'ollama'`. **Conclusion: `boto3` will already be present whenever `strands-agents` is installed, regardless of selected provider.** `ensure_ai_deps()` MUST NOT be changed to skip the boto3 presence check for provider=`ollama` — the check is harmless/idempotent and skipping it would not reduce the actual install footprint. This closes the Gate-0 "can boto3 be skipped for ollama" question: verified, and the answer is no skip is needed or beneficial.
+- **C19 (load-bearing for design/executor):** `strands/models/ollama.py` performs an **unconditional** `import ollama` (the PyPI client) at module load time (line 12). `strands.models`' own lazy-loading `__getattr__` (in `strands/models/__init__.py`) is bypassed by any `from strands.models.ollama import OllamaModel` or `from strands.models import OllamaModel` statement placed at **module top-level** in `agent/onboard_agent.py`, because `from X import Y` resolves the attribute immediately at import time. A naive top-level import would force the `ollama` pip package to be installed even for `bedrock`-only runs, breaking GO2/C20. The `OllamaModel` import MUST be deferred inside the provider-conditional branch of `create_agent()` (i.e., imported only when provider=`ollama` is actually selected).
+- **C20:** Existing Bedrock behavior (FR-7, FR-11, FR-12, R4, NFR-4) SHALL be preserved unchanged when `ARDCONFIG_LLM_PROVIDER=bedrock`. This delta is additive, not a replacement.
+- **C21:** `conf/ardconfig.conf` and README.md's env-var documentation (currently lines ~244–246 and the "Prerequisites" line under `ardconfig-onboard`, ~line 111) need corresponding entries for the three new env vars and the reversed default. Flagged for requirements-engineer/docs-release; not edited in this pass.
+- **C22:** IF the `ollama` PyPI package is pinned, it SHOULD match the range strands-agents itself validates against for its `ollama` extra: `ollama<1.0.0,>=0.4.8` (per `strands_agents-1.40.0.dist-info/METADATA`), to avoid installing an incompatible major version relative to what the installed `strands-agents` release was tested with.
+
+### 12.6 Success Metrics & Acceptance Criteria (Delta)
+
+- **AC-010:** With `ARDCONFIG_LLM_PROVIDER` unset (or `=ollama`) and a local Ollama server running the configured model, `ardconfig-onboard` proceeds through onboarding without invoking `check_aws_credentials` and without requiring AWS credentials to be present.
+- **AC-011:** With `ARDCONFIG_LLM_PROVIDER=bedrock`, `ardconfig-onboard`'s prereq checks, agent construction, and exit codes are identical to the pre-delta implementation (regression check against AC-001–AC-009).
+- **AC-012:** With `ARDCONFIG_LLM_PROVIDER=ollama` and no server reachable at `ARDCONFIG_OLLAMA_HOST`, `ardconfig-onboard` exits with code 2 and a clear error message before the agent is invoked.
+- **AC-013:** Setting `ARDCONFIG_LLM_PROVIDER` to a value other than `bedrock`/`ollama` exits with code 2 and a clear error message identifying the invalid value.
+- **AC-014:** `ensure_ai_deps()` installs the `ollama` PyPI package when provider=`ollama` and it is missing, and does not attempt to install it when provider=`bedrock`.
+- **AC-015:** `ARDCONFIG_OLLAMA_HOST` and `ARDCONFIG_OLLAMA_MODEL` are configurable via environment variable and `conf/ardconfig.conf`, defaulting to `http://localhost:11434` and `gpt-oss:latest` respectively when unset.
+- **AC-016:** A venv with `strands-agents` installed but **without** the `ollama` pip package present can still successfully run `ardconfig-onboard` with `ARDCONFIG_LLM_PROVIDER=bedrock` (regression test for C19's lazy-import requirement).
+
+### 12.7 Risks & Edge Cases (Delta)
+
+| # | Risk / Edge Case | Likelihood | Impact | Mitigation |
+|---|---|---|---|---|
+| R12 | **Default-flip breaking change.** Existing callers of `ardconfig-onboard` that rely on today's implicit Bedrock-only behavior (no env var needed) will silently switch to Ollama after this delta ships, and either fail (exit 2, no local server) or produce materially different results (different model, different reliability) with no code change on their end. | Med-High | High | docs-release must prominently flag the default flip (README, CHANGELOG). Confirm at Gate 1 this is the intended UX (see OQ11) — user has approved it at Gate 0, but the blast radius (any non-interactive/CI caller) warrants an explicit second confirmation. |
+| R13 | Ambiguous failure mode when both the `ollama` pip package is missing **and** the Ollama server is unreachable. | Low | Med | Error messages must distinguish "dependency install failure" (JIT-install step) from "server unreachable" (prereq-check step) so users know which layer to fix. |
+| R14 | Local Ollama models (e.g., `gpt-oss:latest`) may be materially less reliable than Bedrock's Claude models at structured JSON output and multi-step tool-calling (FR-8–FR-21 assume a capable tool-using model). No AC in this delta tests Ollama's actual board-identification accuracy. | Med | Med | Carry into requirements/test-engineer phases; consider a golden-test comparison (Nucleo-F411RE) across both providers before declaring parity. |
+| R15 | **Import-order bug.** A naive top-level `from strands.models.ollama import OllamaModel` in `agent/onboard_agent.py` would crash at import time for any environment lacking the `ollama` pip package — including `bedrock`-only runs — because `strands.models`' lazy loader is bypassed by top-level `from X import Y` (see C19). | Med (if not explicitly called out to executor) | High (breaks the previously-working Bedrock flow) | C19 mandates deferred/conditional import; AC-016 is the regression test for this. |
+| R16 | **No established HTTP-reachability-check convention in this codebase.** A grep of all `*.sh` files found zero existing `curl`/`wget` usage, so there is no precedent for how `check_ollama_reachable`-equivalent logic should be implemented (stdlib `urllib` via the venv Python, the `ollama` pip client's own connectivity call, or introducing `curl` as a new bash-level dependency). | Med | Low-Med | Resolve mechanism choice in design phase (OQ12). |
+| R17 | `ARDCONFIG_OLLAMA_MODEL`'s default (`gpt-oss:latest`) is a fact about the user's local machine (confirmed via `ollama list`/`ollama ps` at spec time), not a guarantee for other installs/CI — onboarding will fail with a model-not-found error on any machine that hasn't pulled it. | Med | Med | Error-on-model-not-found should suggest `ollama pull gpt-oss:latest`; reconsider whether this should be the shipped repo-wide default vs. a purely personal override (OQ13). |
+
+### 12.8 Observability / Telemetry (Delta)
+
+- The new provider-conditional prereq checks SHALL log via the existing `[OK]`/`[WARN]`/`[ERROR]` step-tag convention (e.g., a new step name parallel to `aws_creds`, such as `ollama_reachable`), consistent with §8.
+- No new remote telemetry is introduced. Ollama calls stay local by default (`http://localhost:11434`); if `ARDCONFIG_OLLAMA_HOST` is pointed at a remote server, that becomes the first non-AWS, non-board-manager network dependency this tool has — the selected provider and host SHOULD be logged (host is not a secret; NFR-4's credential-security constraint is not implicated since Ollama has no credentials to leak).
+
+### 12.9 Rollout & Backward Compatibility (Delta)
+
+- **Breaking change in default behavior** (not in CLI surface, flags, or exit-code shape): callers that don't set `ARDCONFIG_LLM_PROVIDER` move from Bedrock to Ollama. See R12.
+- No new feature flag is introduced beyond `ARDCONFIG_LLM_PROVIDER` itself, which doubles as the opt-back-in mechanism (`=bedrock`).
+- Rollback plan: same as §9 (remove new script/profiles), plus setting `ARDCONFIG_LLM_PROVIDER=bedrock` fully reverts runtime behavior with no code changes.
+- New dependency: `ollama` PyPI package, JIT-installed like strands-agents/boto3 (C17, C22). `boto3` presence/behavior is unaffected (C18).
+- Docs: README.md's onboarding "Prerequisites" line and env-var table need a docs-release pass to reflect the new default and env vars (C21) — not performed in this update.
+
+### 12.10 Open Questions (Delta)
+
+| # | Question | Suggested Default / Resolution Path | Who Can Answer |
+|---|---|---|---|
+| OQ11 | Given R12's blast radius (any caller not setting `ARDCONFIG_LLM_PROVIDER`), should the default really be `ollama`, or should the pre-delta implicit default (Bedrock) be preserved with Ollama as pure opt-in? | User has approved `ollama` as default at Gate 0. Re-confirm explicitly at Gate 1 approval of this context.md delta, given the scope of who is affected. | User (karl@wehden.com) |
+| OQ12 | What mechanism should the Ollama reachability check use — stdlib `urllib` via the venv Python (matching `check_aws_credentials`'s `python -c "..."` style), the `ollama` pip client's own connectivity call (available only after JIT-install), or a new `curl` dependency (no precedent in this codebase per R16)? | Prefer stdlib `urllib` or the `ollama` client (avoids adding `curl` as a new system dependency); decide ordering relative to `ensure_ai_deps()`. | design-architect |
+| OQ13 | Should `ARDCONFIG_OLLAMA_MODEL`'s shipped default be `gpt-oss:latest` (confirmed only on the user's machine) in `conf/ardconfig.conf`, or should the repo ship no default (fail with an explicit "set ARDCONFIG_OLLAMA_MODEL" error) to avoid silent model-not-found failures on other machines/CI? | Lean toward keeping `gpt-oss:latest` as the code-level fallback (matches user's environment) but ensure the model-not-found error message is actionable. | User / requirements-engineer |
+| OQ14 | Should `ARDCONFIG_LLM_PROVIDER` also be settable via `conf/ardconfig.conf` (like `ARDCONFIG_BEDROCK_MODEL`), or environment-variable-only? C15 assumes the conf-file pattern applies to all three new vars — confirm this extends to the provider switch itself. | Yes, follow C11's established pattern for all three vars for consistency. | requirements-engineer |
+| OQ15 | Does the JIT-install philosophy (FR-22) extend to auto-pulling the configured Ollama model (`ollama pull <model>`) if absent locally, or is model management explicitly out of scope (NGO5)? | Out of scope for this pass — surface a clear "model not found, run `ollama pull <model>`" error instead of auto-pulling (which could download several GB unexpectedly). | User / requirements-engineer |
+| OQ16 | Existing G7 (§2) states the agent "uses the Strands AI SDK with Amazon Bedrock as the LLM backend" — this is no longer true for the default configuration after this delta. Should requirements-engineer amend G7's wording (and FR-7) when `spec/requirements.md` is updated for this scope, or is G7 understood as scoped to the `bedrock` provider path only? | Amend FR-7 (not G7's historical text) when requirements.md is next revised, to read as provider-conditional; leave §2 of this document as the historical record of the original Bedrock-only scope. | requirements-engineer |

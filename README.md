@@ -90,25 +90,32 @@ Unrecognized USB devices (vendor/product ID not matching any profile) are report
 
 ### `ardconfig-onboard`
 
-AI-powered board onboarding. Plug in an unknown board and let a Strands AI agent (backed by Amazon Bedrock) research it, generate a board profile, install the core, and verify compilation.
+> **Default LLM backend changed:** `ardconfig-onboard` now defaults to a local **Ollama** backend instead of Amazon Bedrock. If you relied on the previous implicit-Bedrock behavior, set `ARDCONFIG_LLM_PROVIDER=bedrock` (see below) to keep using Bedrock — behavior on that path is unchanged.
+
+AI-powered board onboarding. Plug in an unknown board and let a Strands AI agent — backed by a provider-selectable LLM backend (local Ollama by default, or Amazon Bedrock as an opt-in) — research it, generate a board profile, install the core, and verify compilation.
 
 ```bash
 bin/ardconfig-onboard                                          # Auto-detect unknown USB device
 bin/ardconfig-onboard --vendor-id 0483 --product-id 374b       # Headless mode (no hardware needed)
 bin/ardconfig-onboard --board-name "Nucleo-F411RE"             # Research by name
 bin/ardconfig-onboard --non-interactive --json                 # Agent/CI mode
+ARDCONFIG_LLM_PROVIDER=bedrock bin/ardconfig-onboard            # Use Amazon Bedrock instead of Ollama
 ```
 
 What it does:
 1. Scans USB for unrecognized devices (or accepts `--vendor-id`/`--product-id`/`--board-name`)
-2. Invokes a Strands AI agent to research the board (FQBN, core, board manager URL, driver, LED pin, etc.)
+2. Invokes a Strands AI agent to research the board (FQBN, core, board manager URL, driver, LED pin, etc.), using the LLM backend selected via `ARDCONFIG_LLM_PROVIDER` (`ollama` default, or `bedrock`)
 3. Generates and validates a board profile JSON
 4. Prompts for confirmation (auto-approved in `--non-interactive` mode)
 5. Writes the profile to `profiles/`, updates udev rules for new vendor IDs
 6. Runs `ardconfig-setup` to install the core and `ardconfig-verify` to compile a test sketch
 7. If setup or verify fails, the agent iterates (adjusts profile, retries)
 
-**Prerequisites:** AWS credentials configured with Amazon Bedrock access. AI dependencies (`strands-agents`, `boto3`) are installed automatically on first use.
+**Prerequisites:** Depends on the selected `ARDCONFIG_LLM_PROVIDER`:
+- **`ollama` (default):** a local Ollama server running and reachable (default `http://localhost:11434`), with the configured model pulled (default `gpt-oss:latest`, via `ollama pull gpt-oss:latest`). If you point `ARDCONFIG_OLLAMA_HOST` at a non-localhost address, board/USB metadata and prompts will be sent to that server unauthenticated (Ollama has no built-in auth), so only point it at a host you trust.
+- **`bedrock`:** AWS credentials configured with Amazon Bedrock access.
+
+AI dependencies (`strands-agents`, `boto3`, and `ollama` when `ARDCONFIG_LLM_PROVIDER=ollama`) are installed automatically on first use.
 
 ### `ardconfig-discover`
 
@@ -279,8 +286,15 @@ ARDCONFIG_BOARDS="uno-q,r4wifi,giga"   # Boards to install
 ARDCONFIG_VENV_PATH=".venv"            # Python venv location
 ARDCONFIG_PYTHON_PACKAGES="pyserial"   # Python packages
 ARDCONFIG_CLI_VERSION=""               # arduino-cli version (empty = latest)
-ARDCONFIG_BEDROCK_MODEL=""             # Bedrock model (default: us.anthropic.claude-sonnet-4-6)
-ARDCONFIG_AWS_REGION=""                # AWS region (default: us-west-2)
+
+# AI onboarding settings (ardconfig-onboard) use conditional assignment
+# (: "${VAR:=}") rather than plain "VAR=value", so a value you already
+# exported in your shell isn't silently overwritten when this file is sourced:
+: "${ARDCONFIG_LLM_PROVIDER:=}"        # "bedrock" or "ollama" (default: ollama)
+: "${ARDCONFIG_BEDROCK_MODEL:=}"       # Bedrock model (default: us.anthropic.claude-sonnet-4-6) (provider=bedrock only)
+: "${ARDCONFIG_AWS_REGION:=}"          # AWS region (default: us-west-2) (provider=bedrock only)
+: "${ARDCONFIG_OLLAMA_HOST:=}"         # Ollama server URL (default: http://localhost:11434) (provider=ollama only)
+: "${ARDCONFIG_OLLAMA_MODEL:=}"        # Ollama model tag (default: gpt-oss:latest) (provider=ollama only)
 ```
 
 ### `conf/known-macs.conf`
@@ -334,7 +348,7 @@ ardconfig/
 │   ├── ardconfig-onboard   # AI-powered board onboarding
 │   ├── ardconfig-verify
 │   └── ardconfig-health
-├── agent/                  # Python AI agent (Strands AI + Bedrock)
+├── agent/                  # Python AI agent (Strands AI: Bedrock or Ollama)
 │   ├── __init__.py
 │   ├── onboard_agent.py    # Agent definition and entry point
 │   └── tools.py            # Agent tool definitions

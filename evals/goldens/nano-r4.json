@@ -1,0 +1,24 @@
+{
+  "case_id": "nano-r4",
+  "description": "Official Arduino Renesas core, no core_url, cheap/fast case: arduino:renesas_uno is already installed in a typical ardconfig-setup'd dev environment. Chosen to add board-family diversity (non-AVR) to the golden set without adding install cost.",
+  "input": {
+    "vendor_id": "2341",
+    "product_id": "0074",
+    "board_name": "Arduino Nano R4"
+  },
+  "expected": {
+    "usb_vendor_id": "2341",
+    "usb_product_id": "0074",
+    "fqbn": "arduino:renesas_uno:nanor4",
+    "core": "arduino:renesas_uno",
+    "core_url": "",
+    "required_fields": [
+      "id", "name", "fqbn", "core", "core_url",
+      "usb_vendor_id", "usb_product_id", "usb_driver",
+      "serial_pattern", "network_discoverable",
+      "mac_oui_prefixes", "blink_led_pin", "notes"
+    ]
+  },
+  "reference_profile": "profiles/nano-r4.json",
+  "weight": "cheap"
+}
