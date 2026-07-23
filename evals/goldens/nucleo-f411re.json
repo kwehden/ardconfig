@@ -1,0 +1,24 @@
+{
+  "case_id": "nucleo-f411re",
+  "description": "Third-party core (STMicroelectronics:stm32) with a non-empty core_url. Explicitly named by spec/design.md's Verification Strategy as the golden-path regression board (AC-001-011). HEAVIER than uno-r3/nano-r4: the STM32 core is not pre-installed in a stock dev environment, so run_setup triggers a real network core-manager-URL fetch + core install on first run, in addition to the compile in run_verify. Expect several extra minutes versus the 'cheap' cases; run with --boards nucleo-f411re --timeout 900 in isolation the first time.",
+  "input": {
+    "vendor_id": "0483",
+    "product_id": "374b",
+    "board_name": "Nucleo-F411RE"
+  },
+  "expected": {
+    "usb_vendor_id": "0483",
+    "usb_product_id": "374b",
+    "fqbn": "STMicroelectronics:stm32:Nucleo_64:pnum=NUCLEO_F411RE",
+    "core": "STMicroelectronics:stm32",
+    "core_url": "https://github.com/stm32duino/BoardManagerFiles/raw/main/package_stmicroelectronics_index.json",
+    "required_fields": [
+      "id", "name", "fqbn", "core", "core_url",
+      "usb_vendor_id", "usb_product_id", "usb_driver",
+      "serial_pattern", "network_discoverable",
+      "mac_oui_prefixes", "blink_led_pin", "notes"
+    ]
+  },
+  "reference_profile": "profiles/nucleo-f411re.json",
+  "weight": "heavy"
+}

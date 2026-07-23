@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+# Only collect the Python-side (agent/) unit tests here. The bash-side
+# (bin/) tests live under tests/bin and run via bats-core (see
+# tests/README.md) — pytest never touches that directory.
+testpaths = ["tests/agent"]
+addopts = "-ra"

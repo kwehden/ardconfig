@@ -1,0 +1,17 @@
+```json
+{
+  "id": "arduino-uno-q",
+  "name": "Arduino Uno Q",
+  "fqbn": "arduino:zephyr:unoq",
+  "core": "arduino:zephyr",
+  "core_url": "",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "0069",
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "LED_BUILTIN",
+  "notes": "Arduino Uno Q board.",
+}
+```

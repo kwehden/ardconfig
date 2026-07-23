@@ -1,0 +1,21 @@
+# Dev/test-only dependencies for ardconfig's test suite (tests/).
+# Not required for normal ardconfig-* usage — install into the project
+# venv only if you intend to run the test suite:
+#   .venv/bin/pip install -r requirements-dev.txt
+pytest>=8.0,<10
+
+# agent/onboard_agent.py unconditionally imports `strands` at module load
+# (it is not a lazily-imported dependency at that top level), and
+# tests/agent/*.py import that module at collection time. That means
+# pytest cannot even collect tests/agent without strands-agents (and its
+# transitive boto3 dependency) installed, regardless of this suite's
+# no-live-API mocking policy (see tests/README.md). ollama is imported
+# lazily inside agent/onboard_agent.py, but tests/agent/test_create_agent.py
+# still monkeypatches/exercises that import path, so it's declared here too.
+# These mirror exactly what bin/ardconfig-onboard's ensure_ai_deps() JIT-
+# installs at runtime (same package set, same ollama version range) so
+# that `pip install -r requirements-dev.txt` alone is sufficient for a
+# fresh clone to run tests, without first running ardconfig-onboard.
+strands-agents
+boto3
+ollama>=0.4.8,<1.0.0

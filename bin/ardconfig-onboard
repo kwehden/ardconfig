@@ -29,7 +29,9 @@ Options:
 Exit codes:
   0  Board onboarded successfully
   1  Onboarding failed
-  2  Missing prerequisites (no AWS creds, no Python, no venv)
+  2  Missing prerequisites (invalid ARDCONFIG_LLM_PROVIDER, no Python/venv,
+     missing AI deps, no AWS credentials [provider=bedrock], or Ollama
+     server/model unavailable [provider=ollama])
   3  No unknown hardware found (hardware-present mode)
   4  Partial success (profile created but setup/verify failed)
 EOF
@@ -53,6 +55,20 @@ parse_onboard_args() {
   parse_args "${passthrough[@]+"${passthrough[@]}"}"
 }
 
+resolve_llm_provider() {
+  ARDCONFIG_LLM_PROVIDER="${ARDCONFIG_LLM_PROVIDER:-ollama}"
+  case "$ARDCONFIG_LLM_PROVIDER" in
+    bedrock|ollama)
+      output_step ok llm_provider "LLM provider: ${ARDCONFIG_LLM_PROVIDER}"
+      ;;
+    *)
+      output_step error llm_provider "Invalid ARDCONFIG_LLM_PROVIDER value: '${ARDCONFIG_LLM_PROVIDER}' (must be 'bedrock' or 'ollama')"
+      output_result "$EXIT_PREREQ"
+      exit "$EXIT_PREREQ"
+      ;;
+  esac
+}
+
 ensure_ai_deps() {
   local venv="${ARDCONFIG_VENV_PATH:-.venv}"
   if [[ ! -f "${venv}/bin/python" ]]; then
@@ -61,8 +77,26 @@ ensure_ai_deps() {
     exit "$EXIT_PREREQ"
   fi
   local missing=()
-  "${venv}/bin/python" -c "import strands" 2>/dev/null || missing+=(strands-agents)
+  if [[ "$ARDCONFIG_LLM_PROVIDER" == "ollama" ]]; then
+    # Probe the exact capability agent/onboard_agent.py's create_agent()
+    # needs for provider=ollama (`from strands.models.ollama import
+    # OllamaModel`), not bare `import strands`. An earlier install from
+    # the former Bedrock-only flow can have a strands-agents version that
+    # imports fine but predates the ollama model submodule, which would
+    # otherwise surface as an opaque agent crash instead of this prereq
+    # check's "please upgrade" message. Pinned to >=1.40.0 — the version
+    # this feature was developed/tested against, confirmed to provide
+    # OllamaModel with the constructor shape create_agent() relies on —
+    # rather than an unpinned bare package, so a failed probe upgrades to
+    # a known-good version instead of whatever pip happens to resolve.
+    "${venv}/bin/python" -c "from strands.models.ollama import OllamaModel" 2>/dev/null || missing+=("strands-agents>=1.40.0")
+  else
+    "${venv}/bin/python" -c "import strands" 2>/dev/null || missing+=(strands-agents)
+  fi
   "${venv}/bin/python" -c "import boto3" 2>/dev/null || missing+=(boto3)
+  if [[ "$ARDCONFIG_LLM_PROVIDER" == "ollama" ]]; then
+    "${venv}/bin/python" -c "import ollama" 2>/dev/null || missing+=("ollama>=0.4.8,<1.0.0")
+  fi
   if [[ ${#missing[@]} -gt 0 ]]; then
     output_step info deps "Installing AI dependencies: ${missing[*]}"
     if ! "${venv}/bin/pip" install --quiet "${missing[@]}"; then
@@ -83,6 +117,67 @@ check_aws_credentials() {
     exit "$EXIT_PREREQ"
   fi
   output_step ok aws_creds "AWS credentials verified"
+}
+
+check_ollama_available() {
+  local venv="${ARDCONFIG_VENV_PATH:-.venv}"
+  local host="${ARDCONFIG_OLLAMA_HOST:-http://localhost:11434}"
+  local model="${ARDCONFIG_OLLAMA_MODEL:-gpt-oss:latest}"
+
+  local host_lc="${host,,}"
+  if [[ ! "$host_lc" =~ ^(https?://)?(localhost|127\.0\.0\.1|\[?::1\]?)(:[0-9]+)?/?$ ]]; then
+    output_step warn ollama_host "ARDCONFIG_OLLAMA_HOST is set to a non-local address (${host}) — board/USB metadata and prompts will be sent to this unauthenticated endpoint."
+  fi
+
+  local status
+  status=$(ARDCONFIG_OLLAMA_HOST="$host" ARDCONFIG_OLLAMA_MODEL="$model" \
+    "${venv}/bin/python" - <<'PYEOF' 2>/dev/null
+import os
+import sys
+
+host = os.environ["ARDCONFIG_OLLAMA_HOST"]
+model = os.environ["ARDCONFIG_OLLAMA_MODEL"]
+
+try:
+    import ollama
+except ImportError:
+    print("DEPS_MISSING")
+    sys.exit(0)
+
+try:
+    client = ollama.Client(host=host)
+    resp = client.list()
+except Exception:
+    print("UNREACHABLE")
+    sys.exit(0)
+
+
+names = {m.model or "" for m in resp.models}
+match = model in names or (":" not in model and f"{model}:latest" in names)
+print("OK" if match else "MODEL_MISSING")
+PYEOF
+  ) || status="UNREACHABLE"
+
+  case "$status" in
+    OK)
+      output_step ok ollama_reachable "Ollama server reachable at ${host}; model '${model}' available"
+      ;;
+    MODEL_MISSING)
+      output_step error ollama_reachable "Ollama server at ${host} is reachable but model '${model}' is not pulled. Run: ollama pull ${model}"
+      output_result "$EXIT_PREREQ"
+      exit "$EXIT_PREREQ"
+      ;;
+    DEPS_MISSING)
+      output_step error ollama_reachable "Python 'ollama' package is not installed. Re-run ardconfig-onboard, or manually: ${venv}/bin/pip install 'ollama>=0.4.8,<1.0.0'"
+      output_result "$EXIT_PREREQ"
+      exit "$EXIT_PREREQ"
+      ;;
+    *)
+      output_step error ollama_reachable "Ollama server unreachable at ${host}. Ensure the Ollama server is running and ARDCONFIG_OLLAMA_HOST is correct."
+      output_result "$EXIT_PREREQ"
+      exit "$EXIT_PREREQ"
+      ;;
+  esac
 }
 
 scan_unknown_devices() {
@@ -167,8 +262,11 @@ invoke_agent() {
   local agent_output
   agent_output=$(echo "$agent_input" | \
     PYTHONPATH="$ARDCONFIG_ROOT" \
+    ARDCONFIG_LLM_PROVIDER="${ARDCONFIG_LLM_PROVIDER:-}" \
     ARDCONFIG_BEDROCK_MODEL="${ARDCONFIG_BEDROCK_MODEL:-}" \
     ARDCONFIG_AWS_REGION="${ARDCONFIG_AWS_REGION:-}" \
+    ARDCONFIG_OLLAMA_HOST="${ARDCONFIG_OLLAMA_HOST:-}" \
+    ARDCONFIG_OLLAMA_MODEL="${ARDCONFIG_OLLAMA_MODEL:-}" \
     "${venv}/bin/python" -m agent.onboard_agent 2>/dev/null) || {
     output_step error agent "AI agent failed to execute"
     output_result "$EXIT_FAIL"
@@ -298,11 +396,17 @@ main() {
   load_config
   output_init "$(get_output_format)" "$ARG_QUIET"
 
+  resolve_llm_provider
+
   # JIT deps
   ensure_ai_deps
 
-  # AWS credential check
-  check_aws_credentials
+  # Provider-conditional prereq check
+  if [[ "$ARDCONFIG_LLM_PROVIDER" == "bedrock" ]]; then
+    check_aws_credentials       # unchanged — FR-23
+  else
+    check_ollama_available      # NEW — FR-27
+  fi
 
   # Determine input
   if [[ -z "$_ONBOARD_VENDOR_ID" && -z "$_ONBOARD_PRODUCT_ID" && -z "$_ONBOARD_BOARD_NAME" ]]; then

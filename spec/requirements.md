@@ -12,6 +12,12 @@ Priority: **Must** (required for MVP), **Should** (expected), **Could** (nice-to
 
 ---
 
+## Amendment History
+
+- **2026-07-20 — Ollama LLM Provider Delta (context.md §12):** Added FR-25–FR-28 and NFR-8 to specify LLM provider selection (`ARDCONFIG_LLM_PROVIDER`, default `ollama`), Ollama connection configuration, provider-conditional prerequisite checks, and the lazy-import constraint for provider-specific model classes. Amended FR-7, FR-11, FR-12, FR-22, and FR-23 so they no longer state or imply Bedrock is the sole/default LLM backend. No original requirement was deleted; each amendment is noted inline at the affected requirement and the prior wording's intent is preserved for the `provider=bedrock` path (see C20).
+
+---
+
 ## Functional Requirements
 
 ### Unknown Device Detection
@@ -68,13 +74,14 @@ WHEN `ardconfig-onboard` is invoked with `--board-name NAME` flag, the system SH
 
 ### AI Agent
 
-**FR-7: Strands AI agent with Bedrock backend**
-The onboarding flow SHALL use a Strands AI agent implemented with the Strands AI SDK, backed by Amazon Bedrock, to research the board and determine profile fields.
+**FR-7 (AMENDED 2026-07-20): Strands AI agent with provider-selectable LLM backend**
+The onboarding flow SHALL use a Strands AI agent implemented with the Strands AI SDK to research the board and determine profile fields. The agent's LLM backend SHALL be selected per the resolved provider (FR-25): `strands.models.bedrock.BedrockModel` WHEN the provider is `bedrock`, or `strands.models.ollama.OllamaModel` WHEN the provider is `ollama` (the default) — each imported per the lazy-import constraint in FR-28.
 
-- Rationale: User-stated requirement. Strands AI provides tool-use agent capabilities; Bedrock provides the LLM.
-- Traces to: G7, C1, C2
+- Amendment note: Original wording stated the agent is "backed by Amazon Bedrock," implying Bedrock as the sole/default LLM backend. This is superseded: Bedrock is now the explicit opt-in path (`ARDCONFIG_LLM_PROVIDER=bedrock`) and Ollama is the new default. The `provider=bedrock` behavior itself is unchanged (see C20, AC-011). This resolves context.md OQ16 without altering G7's historical text in context.md §2, which remains the record of the original Bedrock-only scope.
+- Rationale: User-stated requirement (original). Extended per the Gate-0-approved scope delta (context.md §12) to support a local-first default. Strands AI provides tool-use agent capabilities; the LLM backend is now provider-selectable rather than hardcoded.
+- Traces to: G7, GO1, GO2, C1, C2, C14, C20, OQ16
 - Priority: **Must**
-- Testable: The agent makes at least one Bedrock API call during onboarding and uses the response to populate profile fields.
+- Testable: With provider=`bedrock`, the agent makes at least one Bedrock API call during onboarding and uses the response to populate profile fields (unchanged from original — regression check against AC-011). With provider=`ollama`, the agent makes at least one call to the local Ollama server at `ARDCONFIG_OLLAMA_HOST` and uses the response to populate profile fields, with zero AWS network calls (AC-010).
 
 **FR-8: Agent tools — arduino-cli introspection**
 The Strands AI agent SHALL have access to tools that invoke `arduino-cli board listall` and `arduino-cli core search` to look up FQBNs and core packages.
@@ -103,18 +110,20 @@ The Strands AI agent SHALL have access to tools for reading existing profiles (a
 **FR-11: Configurable Bedrock model**
 The Bedrock model ID SHALL default to Claude Sonnet 4.6 and be configurable via the `ARDCONFIG_BEDROCK_MODEL` environment variable or a setting in `conf/ardconfig.conf`.
 
+- Scope note (added 2026-07-20): Applies only when the resolved provider (FR-25) is `bedrock`; see FR-26 for the analogous `ollama`-provider configuration (`ARDCONFIG_OLLAMA_MODEL`).
 - Rationale: Model availability varies by account and region; users may want to use a different model.
-- Traces to: G7, OQ2
+- Traces to: G7, OQ2, C20
 - Priority: **Must**
-- Testable: Set `ARDCONFIG_BEDROCK_MODEL` to a different model ID; verify the agent uses it.
+- Testable: With provider=`bedrock`, set `ARDCONFIG_BEDROCK_MODEL` to a different model ID; verify the agent uses it.
 
 **FR-12: Configurable AWS region**
 The AWS region for Bedrock calls SHALL default to `us-west-2` and be configurable via `AWS_DEFAULT_REGION` environment variable or `conf/ardconfig.conf`.
 
+- Scope note (added 2026-07-20): Applies only when the resolved provider (FR-25) is `bedrock`; not applicable to `ollama` (no AWS region concept — see FR-26).
 - Rationale: Bedrock model availability varies by region.
-- Traces to: G7, OQ9
+- Traces to: G7, OQ9, C20
 - Priority: **Must**
-- Testable: Set `AWS_DEFAULT_REGION=us-east-1`; verify Bedrock calls go to that region.
+- Testable: With provider=`bedrock`, set `AWS_DEFAULT_REGION=us-east-1`; verify Bedrock calls go to that region.
 
 ### Profile Generation & Validation
 
@@ -194,21 +203,25 @@ WHEN setup or verify fails, the Strands AI agent SHALL analyze the error output,
 
 ### Dependency Management
 
-**FR-22: JIT install of AI dependencies**
-WHEN `ardconfig-onboard` is invoked and `strands-agents` or `boto3` are not installed in the Python venv, the system SHALL install them automatically before proceeding.
+**FR-22 (AMENDED 2026-07-20): JIT install of AI dependencies**
+WHEN `ardconfig-onboard` is invoked and `strands-agents` or `boto3` are not installed in the Python venv, the system SHALL install them automatically before proceeding, regardless of the selected provider.
+WHEN the resolved provider (FR-25) is `ollama` and the `ollama` PyPI package is not installed in the venv, the system SHALL additionally install it automatically before proceeding. WHEN the resolved provider is `bedrock`, the system SHALL NOT attempt to install the `ollama` PyPI package.
 
-- Rationale: JIT — keeps the base install lightweight; AI deps are only needed for onboarding.
-- Traces to: OQ6, R5, C13
+- Amendment note: Original wording covered only `strands-agents`/`boto3`. Extended (not replaced) to add provider-conditional installation of the `ollama` client package. `boto3`'s check/install remains unconditional for both providers — it is verified to be a non-`extra` (always-installed) dependency of `strands-agents` (C18), so no conditional logic should be added to skip it.
+- Rationale: JIT — keeps the base install lightweight; AI deps are only needed for onboarding, and the `ollama` client is only needed for the `ollama` provider path (GO4, C17).
+- Traces to: G7, GO4, OQ6, R5, C13, C17, C18, C22, AC-014
 - Priority: **Must**
-- Testable: Remove strands-agents from venv; run ardconfig-onboard; verify it installs the package and proceeds.
+- Testable: Remove `strands-agents` from venv; run `ardconfig-onboard`; verify it installs `strands-agents` and `boto3` regardless of provider. With provider=`ollama` and the `ollama` pip package absent, verify it is installed automatically. With provider=`bedrock` and the `ollama` pip package absent, verify it is NOT installed (AC-014).
 
-**FR-23: AWS credential validation**
-WHEN `ardconfig-onboard` is invoked, the system SHALL verify that AWS credentials are available and Bedrock access is functional before starting the AI research phase. WHEN credentials are missing or invalid, the system SHALL exit with code 2 (missing prerequisites) and a clear error message.
+**FR-23 (AMENDED 2026-07-20): AWS credential validation (provider-conditional)**
+WHILE the resolved provider (FR-25) is `bedrock`, `ardconfig-onboard` SHALL verify that AWS credentials are available and Bedrock access is functional before starting the AI research phase; WHEN credentials are missing or invalid, the system SHALL exit with code 2 (missing prerequisites) and a clear error message.
+WHILE the resolved provider is `ollama`, this check SHALL be skipped, and the Ollama reachability/model-presence check (FR-27) SHALL run in its place.
 
-- Rationale: Fail fast rather than failing mid-onboarding.
-- Traces to: R4, NFR-4, AC-008
+- Amendment note: Original wording described this check as unconditional for every `ardconfig-onboard` invocation. It is now scoped to `provider=bedrock` only (GO2, GO3, C16); behavior for `provider=bedrock` runs is otherwise unchanged (regression check against AC-011).
+- Rationale: Fail fast rather than failing mid-onboarding; the check is meaningless when no AWS interaction is planned for the run.
+- Traces to: R4, NFR-4, AC-008, AC-010, AC-011, GO2, GO3, C16, C20
 - Priority: **Must**
-- Testable: Unset AWS credentials; run ardconfig-onboard; verify exit code 2 and descriptive error.
+- Testable: With `ARDCONFIG_LLM_PROVIDER=bedrock` and AWS credentials unset, verify exit code 2 and a descriptive error. With `ARDCONFIG_LLM_PROVIDER=ollama` (or unset) and no AWS credentials present, verify onboarding proceeds without this check running (AC-010).
 
 ### Graceful Failure
 
@@ -219,6 +232,46 @@ WHEN the AI agent cannot determine all required profile fields, the system SHALL
 - Traces to: OQ3, R2
 - Priority: **Must**
 - Testable: Mock an AI response that cannot determine the FQBN; verify partial template is output with TODO fields and Kiro suggestion.
+
+### LLM Provider Selection (Ollama Support) — Added 2026-07-20, context.md §12
+
+**FR-25: LLM provider selection**
+WHEN `ardconfig-onboard` is invoked, the system SHALL determine the LLM provider from the `ARDCONFIG_LLM_PROVIDER` environment variable (or the corresponding `conf/ardconfig.conf` setting), defaulting to `ollama` when neither is set.
+IF `ARDCONFIG_LLM_PROVIDER` resolves to a value other than `bedrock` or `ollama`, the system SHALL exit with code 2 (missing prerequisites) and an error message that identifies the invalid value, before performing any provider-specific prerequisite check or invoking the AI agent.
+
+- Rationale: Establishes the provider switch as a first-class, validated setting rather than an implicit code branch; codifies the intentional default flip approved at Gate 0 (previously implicitly Bedrock-only; now defaults to `ollama`). This is the mechanism that makes FR-7's provider selection observable/testable.
+- Traces to: GO1, GO2, C14, AC-013, R12, OQ11, OQ14
+- Priority: **Must**
+- Testable: (a) Unset `ARDCONFIG_LLM_PROVIDER` → agent construction takes the `ollama` path (FR-7). (b) `ARDCONFIG_LLM_PROVIDER=bedrock` → agent construction takes the `bedrock` path. (c) `ARDCONFIG_LLM_PROVIDER=nonsense` → process exits 2 with an error message naming "nonsense"; no AWS or Ollama prerequisite check runs first.
+
+**FR-26: Ollama connection configuration**
+The system SHALL read `ARDCONFIG_OLLAMA_HOST` (default `http://localhost:11434`) and `ARDCONFIG_OLLAMA_MODEL` (default `gpt-oss:latest`) as environment variables, each overridable via a corresponding setting in `conf/ardconfig.conf`, following the existing pattern used for `ARDCONFIG_BEDROCK_MODEL`/`ARDCONFIG_AWS_REGION` (FR-11, FR-12).
+
+- Rationale: Keeps local-Ollama configuration consistent with the existing Bedrock configuration surface (C11, C15). `gpt-oss:latest` is confirmed correct as the default for this codebase's reference environment; other installs/CI are expected to override it via `ARDCONFIG_OLLAMA_MODEL` (OQ13).
+- Traces to: GO5, C15, AC-015, OQ13, OQ14
+- Priority: **Must**
+- Testable: With no env var or conf setting present and provider=`ollama`, the agent connects to `http://localhost:11434` and requests model `gpt-oss:latest`. Setting `ARDCONFIG_OLLAMA_HOST`/`ARDCONFIG_OLLAMA_MODEL` (via env var or `conf/ardconfig.conf`) changes the host/model used.
+
+**FR-27: Ollama reachability and model-presence prerequisite check**
+WHILE the resolved provider (FR-25) is `ollama`, `ardconfig-onboard` SHALL, before invoking the AI agent, verify — via the venv's Python interpreter, consistent with the existing `check_aws_credentials` pattern, and without introducing a new system-level dependency such as `curl` — that: (1) the Ollama server at `ARDCONFIG_OLLAMA_HOST` is reachable, and (2) `ARDCONFIG_OLLAMA_MODEL` is present in that server's `ollama list` output.
+IF the server is unreachable, the system SHALL exit with code 2 and an error message that identifies this as a server-unreachable failure, distinguishable from a dependency-install failure (FR-22).
+IF the server is reachable but the configured model is not present, the system SHALL exit with code 2 with an actionable error message instructing the user to run `ollama pull <model>`; the system SHALL NOT automatically pull the model.
+WHILE the resolved provider is `bedrock`, this check SHALL be skipped (see FR-23).
+
+- Rationale: Fail-fast parity with the existing AWS credential check (FR-23); avoids silent multi-GB downloads (NGO5); gives users a clear, distinguishable remediation path per failure mode (R13).
+- Design note: The exact check mechanism (stdlib `urllib`, the `ollama` pip client, or another approach) is left to design (OQ12) — this requirement constrains observable behavior and failure modes, not the implementation.
+- Traces to: GO3, C16, AC-012, R13, R16, R17, NGO5, OQ12, OQ15
+- Priority: **Must**
+- Testable: (a) `ARDCONFIG_LLM_PROVIDER=ollama` with no server at `ARDCONFIG_OLLAMA_HOST` → exit 2, server-unreachable message, no agent invocation. (b) Server reachable but `ollama list` omits the configured model → exit 2, message includes `ollama pull <model>` guidance, and no automatic pull is attempted. (c) `ARDCONFIG_LLM_PROVIDER=bedrock` → this check does not run; `check_aws_credentials` (FR-23) runs instead (regression check against AC-011).
+
+**FR-28: Provider-conditional lazy import of model backend classes**
+The system SHALL import the provider-specific model class (`strands.models.bedrock.BedrockModel` or `strands.models.ollama.OllamaModel`) only within the code path selected by the resolved provider (FR-25) inside `create_agent()`, and SHALL NOT perform an unconditional top-level import of either class in `agent/onboard_agent.py`.
+IF the resolved provider is `bedrock`, the system SHALL NOT require the `ollama` PyPI package to be installed, importable, or otherwise present for onboarding to succeed.
+
+- Rationale: `strands.models.ollama` performs an unconditional `import ollama` at module load time. A naive top-level `from strands.models.ollama import OllamaModel` bypasses Strands' own lazy-loading `__getattr__` and would break `bedrock`-only runs in any venv lacking the `ollama` pip package (C19, R15).
+- Traces to: GO2, C19, C20, AC-016, R15
+- Priority: **Must**
+- Testable: In a venv with `strands-agents` installed but the `ollama` pip package absent, `ARDCONFIG_LLM_PROVIDER=bedrock` onboarding succeeds end-to-end (AC-016 regression test) — importing `agent.onboard_agent` and calling `create_agent()` with provider=`bedrock` does not raise `ModuleNotFoundError: ollama`.
 
 ---
 
@@ -280,6 +333,14 @@ The onboarding flow SHALL complete within 5 minutes for a typical board, excludi
 - Priority: **Should**
 - Testable: Time the onboarding of Nucleo-F411RE end-to-end; verify < 5 minutes excluding download.
 
+**NFR-8: Provider-selection scope boundary — Added 2026-07-20, context.md §12**
+The introduction of LLM provider selection (FR-25–FR-28) SHALL NOT alter agent tool definitions (`agent/tools.py`), the system prompt in `agent/onboard_agent.py`, the board profile JSON schema (FR-13, C6), profile validation logic (FR-15), udev rule handling (FR-18), or the setup/verify auto-run behavior (FR-19–FR-21).
+
+- Rationale: Bounds the change to model-backend construction only, preventing scope creep during implementation; directly restates GO6/NGO6 as a testable negative requirement.
+- Traces to: GO6, NGO6
+- Priority: **Must**
+- Testable: Diff `agent/tools.py` and the `SYSTEM_PROMPT` constant in `agent/onboard_agent.py` before/after the change; verify no modifications beyond `create_agent()`'s model-construction logic and its supporting imports.
+
 ---
 
 ## Traceability Matrix
@@ -292,7 +353,7 @@ The onboarding flow SHALL complete within 5 minutes for a typical board, excludi
 | FR-4 | G1, G6 | — | — | — |
 | FR-5 | G6 | AC-007 | OQ4 | — |
 | FR-6 | G6 | AC-007 | OQ4 | — |
-| FR-7 | G7 | — | OQ2 | R4, R10 |
+| FR-7 (amended) | G7, GO1, GO2 | AC-010, AC-011 | OQ2, OQ16 | R4, R10 |
 | FR-8 | G2 | — | OQ1 | R1 |
 | FR-9 | G2 | — | OQ1 | R3 |
 | FR-10 | G2, G3 | — | OQ1 | — |
@@ -307,9 +368,13 @@ The onboarding flow SHALL complete within 5 minutes for a typical board, excludi
 | FR-19 | — | AC-003 | OQ8 | — |
 | FR-20 | — | AC-004 | OQ8 | — |
 | FR-21 | — | — | OQ8 | R1, R3 |
-| FR-22 | G7 | — | OQ6 | R5 |
-| FR-23 | — | AC-008 | — | R4 |
+| FR-22 (amended) | G7, GO4 | AC-014 | OQ6 | R5 |
+| FR-23 (amended) | GO2, GO3 | AC-008, AC-010, AC-011 | — | R4 |
 | FR-24 | — | — | OQ3 | R2 |
+| FR-25 (new) | GO1, GO2 | AC-013 | OQ11, OQ14 | R12 |
+| FR-26 (new) | GO5 | AC-015 | OQ13, OQ14 | — |
+| FR-27 (new) | GO3 | AC-012 | OQ12, OQ15 | R13, R16, R17 |
+| FR-28 (new) | GO2 | AC-016 | — | R15 |
 | NFR-1 | — | AC-009 | — | — |
 | NFR-2 | — | AC-008 | — | — |
 | NFR-3 | — | AC-009 | — | — |
@@ -317,3 +382,4 @@ The onboarding flow SHALL complete within 5 minutes for a typical board, excludi
 | NFR-5 | — | — | — | R7 |
 | NFR-6 | G3 | AC-002 | — | — |
 | NFR-7 | — | — | — | R10 |
+| NFR-8 (new) | GO6 | — | — | — |

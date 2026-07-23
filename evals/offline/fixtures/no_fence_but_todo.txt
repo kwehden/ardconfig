@@ -1,0 +1,19 @@
+I was not able to conclusively determine the FQBN or core package for this
+device from the USB vendor/product ID and board name alone, and arduino-cli
+board listall did not return a confident match.
+
+{
+  "id": "TODO",
+  "name": "TODO",
+  "fqbn": "TODO",
+  "core": "TODO",
+  "core_url": "",
+  "usb_vendor_id": "1a86",
+  "usb_product_id": "7523",
+  "usb_driver": "TODO",
+  "serial_pattern": "TODO",
+  "network_discoverable": false,
+  "mac_oui_prefixes": [],
+  "blink_led_pin": "TODO",
+  "notes": "Could not identify this board with confidence; please ask Kiro to help complete this profile."
+}

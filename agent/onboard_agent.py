@@ -5,7 +5,6 @@ import os
 import re
 
 from strands import Agent
-from strands.models.bedrock import BedrockModel
 from agent.tools import (
     arduino_cli_search, read_file, write_file,
     validate_profile, run_setup, run_verify
@@ -44,20 +43,53 @@ If you cannot determine all fields, set unknown fields to "TODO" and explain wha
 
 
 def create_agent():
-    model_id = os.environ.get(
-        "ARDCONFIG_BEDROCK_MODEL",
-        "us.anthropic.claude-sonnet-4-6"
-    )
-    region = os.environ.get(
-        "ARDCONFIG_AWS_REGION",
-        os.environ.get("AWS_DEFAULT_REGION", "us-west-2")
-    )
-    model = BedrockModel(model_id=model_id, region_name=region)
+    """Construct the Strands Agent with a provider-selected LLM backend.
+
+    Reads ARDCONFIG_LLM_PROVIDER (default "ollama"). The provider-specific
+    model class is imported lazily, inside the selected branch only
+    (FR-28) — this avoids requiring the `ollama` PyPI package when
+    provider=bedrock, and avoids requiring `boto3`-backed Bedrock setup
+    when provider=ollama.
+
+    Raises:
+        ValueError: if ARDCONFIG_LLM_PROVIDER resolves to a value other
+            than "bedrock" or "ollama". In the normal CLI path this is
+            unreachable — bin/ardconfig-onboard's resolve_llm_provider()
+            validates and exits 2 before this function is ever called.
+            This guard exists for direct/library-level invocation (e.g.
+            unit tests calling create_agent() without going through the
+            bash wrapper).
+    """
+    provider = os.environ.get("ARDCONFIG_LLM_PROVIDER") or "ollama"
+
+    if provider == "bedrock":
+        from strands.models.bedrock import BedrockModel
+
+        model_id = os.environ.get("ARDCONFIG_BEDROCK_MODEL") or "us.anthropic.claude-sonnet-4-6"
+        region = (
+            os.environ.get("ARDCONFIG_AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or "us-west-2"
+        )
+        model = BedrockModel(model_id=model_id, region_name=region)
+    elif provider == "ollama":
+        from strands.models.ollama import OllamaModel
+
+        host = os.environ.get("ARDCONFIG_OLLAMA_HOST") or "http://localhost:11434"
+        model_id = os.environ.get("ARDCONFIG_OLLAMA_MODEL") or "gpt-oss:latest"
+        model = OllamaModel(host=host, model_id=model_id)
+    else:
+        raise ValueError(
+            f"Invalid ARDCONFIG_LLM_PROVIDER: '{provider}' "
+            f"(must be 'bedrock' or 'ollama')"
+        )
+
     return Agent(
         model=model,
         system_prompt=SYSTEM_PROMPT,
         tools=[arduino_cli_search, read_file, write_file,
-               validate_profile, run_setup, run_verify]
+               validate_profile, run_setup, run_verify],
+        callback_handler=None
     )
 
 

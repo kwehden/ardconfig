@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Fake "pip" for tests/bin/test_ardconfig_onboard.bats's fake_venv fixture
+# (see the sibling `python` script for the full fixture-mode rationale).
+#
+# Used only in ARDCONFIG_TEST_FIXTURE_MODE=missing_deps: records the
+# packages it was asked to install (so the AC-014 test can assert on
+# exactly what ensure_ai_deps() computed as "missing") and always reports
+# success without touching the network or installing anything real.
+set -euo pipefail
+
+if [[ -n "${ARDCONFIG_TEST_FAKE_PIP_LOG:-}" ]]; then
+  printf '%s\n' "$*" >> "$ARDCONFIG_TEST_FAKE_PIP_LOG"
+fi
+exit 0

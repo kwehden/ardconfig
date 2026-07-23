@@ -1,0 +1,24 @@
+{
+  "case_id": "uno-r3",
+  "description": "Official Arduino AVR core, no core_url, cheap/fast case: arduino:avr is already installed in a typical ardconfig-setup'd dev environment, so run_setup/run_verify do not trigger a fresh core install. Chosen as the default smoke case for that reason.",
+  "input": {
+    "vendor_id": "2341",
+    "product_id": "0043",
+    "board_name": "Arduino Uno R3"
+  },
+  "expected": {
+    "usb_vendor_id": "2341",
+    "usb_product_id": "0043",
+    "fqbn": "arduino:avr:uno",
+    "core": "arduino:avr",
+    "core_url": "",
+    "required_fields": [
+      "id", "name", "fqbn", "core", "core_url",
+      "usb_vendor_id", "usb_product_id", "usb_driver",
+      "serial_pattern", "network_discoverable",
+      "mac_oui_prefixes", "blink_led_pin", "notes"
+    ]
+  },
+  "reference_profile": "profiles/uno-r3.json",
+  "weight": "cheap"
+}
