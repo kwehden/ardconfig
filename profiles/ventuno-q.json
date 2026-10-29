@@ -1,0 +1,14 @@
+{
+  "id": "ventuno-q",
+  "name": "Arduino Ventuno Q",
+  "fqbn": "arduino:zephyr:ventunoq",
+  "core": "arduino:zephyr",
+  "core_url": "https://downloads.arduino.cc/packages/package_zephyr_index.json",
+  "usb_vendor_id": "2341",
+  "usb_product_id": "007a",
+  "usb_driver": "cdc_acm",
+  "serial_pattern": "/dev/ttyACM*",
+  "network_discoverable": true,
+  "mac_oui_prefixes": [],
+  "notes": "USB detection verified on hardware. Compilation and upload are unverified; require a Zephyr core release containing the ventunoq target."
+}

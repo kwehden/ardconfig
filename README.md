@@ -8,6 +8,7 @@ Reusable bootstrap package for configuring Ubuntu systems to develop with Arduin
 |---|---|---|---|
 | Arduino Uno R3 | `uno-r3` | `arduino:avr:uno` | `arduino:avr` |
 | Arduino Uno Q | `uno-q` | `arduino:zephyr:unoq` | `arduino:zephyr` (BETA) |
+| Arduino Ventuno Q | `ventuno-q` | `arduino:zephyr:ventunoq` | `arduino:zephyr` (detection verified) |
 | Arduino Nano R4 | `nano-r4` | `arduino:renesas_uno:nanor4` | `arduino:renesas_uno` |
 | Arduino Uno R4 WiFi | `r4wifi` | `arduino:renesas_uno:unor4wifi` | `arduino:renesas_uno` |
 | Arduino Giga R1 WiFi | `giga` | `arduino:mbed_giga:giga` | `arduino:mbed_giga` |
@@ -15,6 +16,8 @@ Reusable bootstrap package for configuring Ubuntu systems to develop with Arduin
 | STM32 Nucleo-F411RE | `nucleo-f411re` | `STMicroelectronics:stm32:Nucleo_64:pnum=NUCLEO_F411RE` | `STMicroelectronics:stm32` |
 
 The **Giga Display Shield** (ASX00039) is a peripheral that attaches to the Giga R1 WiFi board — the `giga` profile covers both.
+
+The **Ventuno Q** profile recognizes USB ID `2341:007a` using the [`ventunoq` target in ArduinoCore-zephyr](https://github.com/arduino/ArduinoCore-zephyr/blob/main/boards.txt). USB detection was verified on hardware, and the same board advertised itself over mDNS. Compilation and upload have not been verified. The locally installed `arduino:zephyr` 0.56.0 core did not contain this target; development requires a core release that includes it.
 
 The **Nucleo-F411RE** is the first non-Arduino-branded board, onboarded via the AI-powered `ardconfig-onboard` flow.
 
